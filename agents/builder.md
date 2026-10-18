@@ -38,6 +38,9 @@ You are a CAD engineer who writes CadQuery (Python) code. You receive the **feat
 - **tapped_hole**: a plain hole at the tap-drill diameter (M3 → 2.5, M4 → 3.3, M5 → 4.2, M6 → 5.0, M8 → 6.8, M10 → 8.5, M12 → 10.2). No thread geometry.
 - **external_thread**: the plain cylinder at the nominal diameter. No thread geometry.
 - **slot**: `cq.Workplane("XY").slot2D(length, width, angle)` extruded as a cutter.
+- **Round features** (`d`, `profile: "circle"`, or anything dimensioned with Ø): build them with `circle()`, `makeCylinder` or `revolve`, never with a polyline of points, even if a profile list is given.
+- **Union order**: add each solid so it touches what is already built (the base, then what stands on it, then what that carries: plate → support → barrel → flange), or collect the bosses and fuse them in one call (`a.fuse(b, c, d)`). Never union a part that does not touch the body yet: the body then falls into separate pieces, and CadQuery can silently drop a later part that should join them.
+- **Features that extend into another** (`extends_into`): their height is already computed up to that body's axis; build them at full height and union them with the body, so the part inside it disappears.
 - **Placements**: when a feature has `placements`, build one copy per entry, at its `at` point, along its `direction`, with its length along its `long_axis`. Use these numbers as given; do not recompute positions.
 - **Long axis**: `slot2D(length, width, angle)` lays the length along the workplane's local x at angle 0; choose the workplane and angle so the length runs along the feature's `long_axis` in the part frame, and check it in the measurements (the bounding box of the slot's cutter, or the cylinder positions).
 - **Patterns**: compute the list of centre points in Python (rectangular: `±dx/2, ±dy/2` around the pattern centre; circular: `pitch_diameter/2` at `start_angle + i * 360/count`) and make one cutter per point.

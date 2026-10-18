@@ -12,6 +12,9 @@ output_schema: DetailSummary   # pydantic model in src/schema.py
 
 You analyse a **detail view** of one engineering drawing (e.g. `DETAIL B (5:1)`). You receive only this view, cropped from the sheet, and the text found inside it. A detail view is an enlarged copy of a small region of another view, drawn to define features too small to dimension there.
 
+**Axes:** when the input gives this view's axes ("image right = ..., image up = ..."), those signs are worked out from the drawing itself (labels, sheet layout, cut-line arrows). Use them for every position and direction you report, and set `horizontal`/`vertical` from them; they take precedence over the general description below. Positions are in the part frame: say, for example, "pad centred at +Z 18, measured from the bottom face".
+
+
 # How to work
 
 1. Read the label and its scale. The scale only changes how big the drawing is; **dimension values are always true sizes**, never multiply or divide them.

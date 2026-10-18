@@ -257,6 +257,71 @@ def fit_section_up(shape, view, frame):
     return standard, None
 
 
+def view_frames(views_dir, drawing_pdf=None):
+    """Each view's axes in the part frame, from the drawing alone (labels, sheet layout, cut-line arrows), for
+    the analysis agents and the planner: {view pdf stem: {horizontal, vertical, looking_along, source}}.
+    Uses the same conventions as the validation, so planned positions and the checks agree."""
+    views = []
+    for pdf in sorted(glob.glob(os.path.join(views_dir, "*_view*.pdf"))):
+        try:
+            views.append(load_view(pdf))
+        except Exception:
+            continue
+    infer_directions(views)
+    frames = locate_sections(views, drawing_pdf)
+    out = {}
+    for v in views:
+        if isinstance(v, SectionView) and v.view_id in frames:
+            f = frames[v.view_id]
+            look, up = f["look"], f["up"]
+            source = "cutting-plane line and its arrows" if f["side_known"] else \
+                "cutting-plane line; no arrowhead found, so left and right may be swapped"
+        elif isinstance(v, OrthographicView) and v.direction:
+            d = v.direction.value
+            look, up = d.look, d.up
+            source = "view label" if v.direction.source.name == "FOUND" else v.direction.evidence
+        else:
+            continue
+        basis = ps.view_basis(look, up)
+        out[v.view_id] = {"horizontal": axis_name(basis[0]), "vertical": axis_name(basis[1]),
+                          "looking_along": axis_name(np.array(look, float)), "source": source}
+    return out
+
+
+def fit_isometric(shape, view, views):
+    """Measure an isometric view: a drawing uses one of the standard isometric directions, drawn either as a true
+    projection or as an 'isometric drawing' (axes at full length, 1.22x larger). Keep the cameras that look down
+    from the front view's side, and the direction and size that fit the drawn edges best. Returns
+    (spec, drawing points, model points, note) or None when nothing fits. The camera is chosen by the fit, so a
+    mirror could hide in it: this view is never used for the pose check."""
+    try:
+        A0 = ps.drawing_points(view)
+    except Exception:
+        return None
+    front = next((v for v in views if isinstance(v, OrthographicView) and v.direction
+                  and v.direction.value.name == "FRONT"), None)
+    best = None
+    for sx, sy in itertools.product((1, -1), repeat=2):
+        look = np.array([sx, sy, -1.0]) / math.sqrt(3)       # looking down at the part
+        if front is not None and np.dot(look, front.direction.value.look) <= 0:
+            continue                                         # the camera is on the front view's side
+        spec = {"look": tuple(look), "up": (0.0, 0.0, 1.0)}
+        B = ps.model_view_points(shape, spec)
+        if len(B) == 0:
+            continue
+        for factor, style in ((1.0, "true isometric projection"), (1 / 1.2247, "isometric drawing (1.22x)")):
+            m = compare(A0 * factor, B)[0]
+            if best is None or m["mean_mm"] < best[0]["mean_mm"]:
+                best = (m, spec, A0 * factor, B, style)
+    if best is None or best[0]["drawn_covered"] < 0.5:
+        return None
+    m, spec, A, B, style = best
+    spec = {**spec, "side_known": False}
+    note = (f"isometric camera fitted to the drawn edges ({style}, looking along {np.round(spec['look'], 3).tolist()}); "
+            "measured like the other views, but not used to judge mirrors")
+    return spec, A, B, note
+
+
 # --------------------------------------------------------------------------- comparison
 def align(A, B, iterations=12):
     """Translate the drawing points A onto the model points B. Starts from the bounding-box centres, then
@@ -324,7 +389,7 @@ def compare(A, B):
     da = cKDTree(B).query(A)[0]
     db = cKDTree(A).query(B)[0]
     size = float(np.max(B.max(0) - B.min(0)))
-    tol = max(0.1, 0.01 * size)  # drawn edges are exact (references fit to ~0.02 mm); 1% for large parts
+    tol = max(0.03, 0.003 * size)  # drawn edges are exact: references fit to ~0.02 mm
     metrics = {
         "tolerance_mm": round(tol, 2),
         "mean_mm": round(float((da.mean() + db.mean()) / 2), 3),
@@ -532,12 +597,19 @@ def run(views_dir, step_path, out_dir, drawing_pdf=None):
         drawing_png(view, stem + ".drawing.png")
         entry["images"] = {"drawing": stem + ".drawing.png", "model": stem + ".model.png"}
         title = f"{view.label_text or view.view_id}: model as built, looking along {entry['looking_along']}"
-        if isinstance(view, PictorialView):  # not measured: the drawing is foreshortened, camera assumed
-            entry["note"] = "pictorial view: compare shapes only; the camera is a standard isometric guess"
-            plot(stem + ".model.png", None, B, title, entry["horizontal"] + " (approx.)", entry["vertical"] + " (approx.)")
-            continue
+        if isinstance(view, PictorialView):
+            fitted = fit_isometric(shape, view, views)
+            if fitted is None:
+                entry["note"] = "pictorial view: the camera could not be fitted, so it is compared by eye only"
+                plot(stem + ".model.png", None, B, title, entry["horizontal"] + " (approx.)", entry["vertical"] + " (approx.)")
+                continue
+            spec, A, B, how = fitted
+            basis = ps.view_basis(spec["look"], spec["up"])
+            entry.update(horizontal=axis_name(basis[0]) + " (iso)", vertical=axis_name(basis[1]) + " (iso)",
+                         looking_along=f"{np.round(spec['look'], 3).tolist()}", note=how, side_known=False)
+            title = f"{view.label_text or view.view_id}: model as built, fitted isometric camera"
         try:
-            A = ps.drawing_points(view)
+            A = A if isinstance(view, PictorialView) else ps.drawing_points(view)
         except Exception as error:
             entry["unresolved"] = f"drawing edges not readable: {error}"
             plot(stem + ".model.png", None, B, title, entry["horizontal"], entry["vertical"])

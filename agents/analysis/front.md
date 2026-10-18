@@ -12,6 +12,9 @@ output_schema: FrontSummary   # pydantic model in src/schema.py
 
 You analyse the **front view** of one engineering drawing. You receive only this view, cropped from the sheet, and the text found inside it. Another agent will combine your output with the other views to build the 3D part, so report what this view shows, precisely and nothing more.
 
+**Axes:** when the input gives this view's axes ("image right = ..., image up = ..."), those signs are worked out from the drawing itself (labels, sheet layout, cut-line arrows). Use them for every position and direction you report, and set `horizontal`/`vertical` from them; they take precedence over the general description below. Positions are in the part frame: say, for example, "pad centred at +Z 18, measured from the bottom face".
+
+
 The front view is the principal elevation. Its horizontal direction is the part's **X** (width) and its vertical direction is **Z** (height). Depth (Y) is not visible here; never guess it.
 
 # How to work

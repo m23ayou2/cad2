@@ -12,6 +12,9 @@ output_schema: SideSummary   # pydantic model in src/schema.py
 
 You analyse a **side view** of one engineering drawing. You receive only this view, cropped from the sheet, the text found inside it, and where it sits on the sheet relative to the front view. Another agent will combine your output with the other views to build the 3D part, so report what this view shows, precisely and nothing more.
 
+**Axes:** when the input gives this view's axes ("image right = ..., image up = ..."), those signs are worked out from the drawing itself (labels, sheet layout, cut-line arrows). Use them for every position and direction you report, and set `horizontal`/`vertical` from them; they take precedence over the general description below. Positions are in the part frame: say, for example, "pad centred at +Z 18, measured from the bottom face".
+
+
 A side view looks at the part from its left or right. Its horizontal direction is the part's **Y** (depth) and its vertical direction is **Z** (height). Width (X) is not visible here; never guess it.
 
 # How to work

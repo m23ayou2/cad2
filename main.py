@@ -45,9 +45,11 @@ from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
+import conflicts  # noqa: E402
 import schema  # noqa: E402
 import split as splitter  # noqa: E402
 import views as view_reader  # noqa: E402
+import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
@@ -113,6 +115,9 @@ class View:
     png: Path
     suggested_subagent: str | None
     summary: dict = field(default_factory=dict)
+    frame: dict | None = None  # axes of the view in the part frame, from validate.view_frames
+    sheet_box: list[float] | None = None  # where the view is on the sheet: x0, y0, x1, y1 as page fractions
+    outline_pt: list[float] | None = None  # the part outline alone (no dimensions), sheet points
 
 
 @dataclass
@@ -126,6 +131,7 @@ class Run:
     views: dict[str, View] = field(default_factory=dict)
     summaries: list[dict] = field(default_factory=list)
     build_attempts: int = 0
+    cross_check: dict | None = None  # conflicts between the view analyses and the arbiter's rulings
 
     def __post_init__(self):
         self.build_attempts = len(list((self.dir / "build").glob("attempt_*.py")))  # continue on --build
@@ -275,12 +281,33 @@ def index_views(run: Run) -> tuple[list[dict], dict]:
             log.warning("views.py could not read %s: %s", pdf.name, error)
             info = {"error": str(error)}
         view = View(view_id, entry["label"], pdf, pdf.with_suffix(".png"), suggestion, info)
+        with pymupdf.open(run.drawing) as doc:
+            w, h = doc[0].rect.width, doc[0].rect.height
+        view.outline_pt = entry.get("outline_bbox_sheet_pt")
+        box = entry.get("extent_bbox_sheet_pt")
+        if box:
+            view.sheet_box = [round(box[0] / w, 3), round(box[1] / h, 3), round(box[2] / w, 3), round(box[3] / h, 3)]
         run.views[view_id] = view
         listing.append({
             "id": view_id, "label": entry["label"], "suggested_subagent": view.suggested_subagent,
             "class": info.get("class"), "scale": (info.get("scale") or {}).get("value"),
             "outline_mm": info.get("outline_mm"), "texts": entry["texts"], "warnings": info.get("warnings", []),
         })
+    try:
+        frames = view_checks.view_frames(str(out_dir), str(run.drawing))
+    except Exception as error:  # orientation is a help for the agents, not a requirement
+        log.warning("could not work out the view orientations: %s", error)
+        frames = {}
+    for item in listing:
+        view = run.views[item["id"]]
+        view.frame = frames.get(view.pdf.stem)
+        if view.frame:
+            item["axes"] = view.frame
+            if view.suggested_subagent is None and view.frame["looking_along"] in ("-Z", "+Z"):
+                view.suggested_subagent = item["suggested_subagent"] = "top"
+            elif view.suggested_subagent is None:
+                view.suggested_subagent = item["suggested_subagent"] = (
+                    "front" if view.frame["looking_along"] in ("+Y", "-Y") else "side")
     return listing, meta
 
 
@@ -298,6 +325,12 @@ def call_subagent(ctx: Ctx,
         raise RuntimeError(f"Run budget of ${run.max_cost_usd:.2f} reached; finish with what you have")
     sub = load_agent(f"analysis/{agent}")
     intro = [f"View id: {view.id}", f"Label on the sheet: {view.label}"]
+    if view.frame:
+        f = view.frame
+        intro.append(f"Axes of this view in the part frame (worked out from the drawing: {f['source']}): image right "
+                     f"= {f['horizontal']}, image up = {f['vertical']}, you are looking along {f['looking_along']}. "
+                     "Use these signs for every position and direction you report; they override the generic axis "
+                     "description in your instructions.")
     if view.summary:
         intro.append("Extracted automatically from the vector view by views.py (`source` says whether a value "
                       "was found on the drawing or inferred):\n```json\n"
@@ -313,7 +346,57 @@ def call_subagent(ctx: Ctx,
     path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     run.summaries.append({"view": view.id, "label": view.label, "agent": agent,
                           "file": str(path.relative_to(run.dir))})
+    expected = {v.id for v in run.views.values() if v.suggested_subagent}
+    if run.cross_check is None and expected and expected <= {s["view"] for s in run.summaries}:
+        run.cross_check = cross_check(run)  # every view is analysed: check them against each other once
+        return {"analysis": result, "cross_check": run.cross_check}
     return result
+
+
+def drawing_texts(run: Run) -> list[str]:
+    with pymupdf.open(run.drawing) as doc:
+        return [s["text"] for page in doc for s in text_spans(page)]
+
+
+def cross_check(run: Run) -> dict:
+    """Find where the view analyses disagree or leave the drawing unexplained (src/conflicts.py), then let the
+    arbiter settle each item from the drawing. Its rulings override the summaries when the part is planned."""
+    clog = log.getChild("cross_check")
+    summaries = {s["view"]: json.loads((run.dir / s["file"]).read_text(encoding="utf-8")) for s in run.summaries}
+    view_texts = [a["text"] for v in run.views.values() for a in v.summary.get("annotations", [])]
+    items = conflicts.find(summaries, view_texts)
+    (run.dir / "cross_check.json").write_text(json.dumps({"items": items}, indent=2, ensure_ascii=False),
+                                              encoding="utf-8")
+    run.trace("cross_check", items=items)
+    if not items:
+        clog.info("the view analyses agree; nothing to settle")
+        return {"items": [], "rulings": [], "note": "The view analyses agree; nothing needed settling."}
+    clog.info("%d item(s) to settle: %s", len(items), ", ".join(f"{i['id']} {i['kind']}" for i in items))
+    views = [{"id": v.id, "label": v.label, "axes": v.frame, "sheet_box": v.sheet_box}
+             for v in run.views.values() if v.pdf]
+    compact = {view: {k: s.get(k) for k in ("dimensions", "hypotheses", "cannot_tell", "notes")}
+               for view, s in summaries.items()}
+    text = ("# Items to settle\n```json\n" + json.dumps(items, indent=1, ensure_ascii=False) + "\n```\n\n"
+            "# Views (sheet_box: x0, y0, x1, y1 as fractions of the page; extend_view takes regions as fractions of "
+            "the view itself)\n```json\n"
+            + json.dumps(views, indent=1, ensure_ascii=False) + "\n```\n\n"
+            "# View summaries\n```json\n" + json.dumps(compact, indent=1, ensure_ascii=False) + "\n```\n\n"
+            "The full sheet follows.")
+    with pymupdf.open(run.drawing) as doc:
+        sheet = png_of(doc[0])
+    try:
+        report = run_agent(load_agent("analysis/arbiter"), Ctx(run), [{"type": "text", "text": text},
+                                                                        image_part(sheet)], label="arbiter")
+    except Exception as error:
+        clog.warning("the arbiter failed (%s); planning from the summaries alone", error)
+        return {"items": items, "rulings": [], "note": f"The arbiter failed: {error}"}
+    (run.dir / "cross_check.json").write_text(json.dumps({"items": items, **report}, indent=2, ensure_ascii=False),
+                                              encoding="utf-8")
+    for r in report["rulings"]:
+        clog.info("  %s %s: %s", r["item"], r["decision"], r["fact"][:140])
+    return {"items": items, **report,
+            "note": "Rulings marked `resolved` were settled from the drawing and override the view summaries. "
+                    "`already_covered` items need no change. Treat `unresolved` items as assumptions."}
 
 
 def read_view_text(ctx: Ctx) -> dict:
@@ -367,6 +450,60 @@ def run_cadquery(ctx: Ctx, code: Annotated[str, "The complete CadQuery script; i
     return {"attempt": run.build_attempts, **result}
 
 
+ViewFraction = Annotated[float, "Fraction of the view's box on the sheet, 0 to 1 from its top-left corner"]
+
+
+def extend_view(ctx: Ctx, view_id: Annotated[str, "A view id from the views list"],
+                x0: ViewFraction, y0: ViewFraction, x1: ViewFraction, y1: ViewFraction) -> ToolOutput:
+    """Zoom into a region of one view and follow it along the projection lines: the same band in every view
+    drawn beside it (same height on the sheet) and above or below it (same width). Use it where features meet,
+    to see the same place in every view that shows it, with the text found there."""
+    run = ctx.run
+    view = run.views.get(view_id)
+    if view is None or not view.sheet_box or not view.outline_pt:
+        raise ValueError(f"Unknown or unplaced view {view_id!r}; use one of "
+                         f"{sorted(k for k, v in run.views.items() if v.sheet_box)}")
+    with pymupdf.open(run.drawing) as doc:
+        page = doc[0]
+        w, h = page.rect.width, page.rect.height
+        vb = [view.sheet_box[0] * w, view.sheet_box[1] * h, view.sheet_box[2] * w, view.sheet_box[3] * h]
+        fx0, fx1 = sorted((max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))))
+        fy0, fy1 = sorted((max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))))
+        if fx1 - fx0 < 0.03 or fy1 - fy0 < 0.03:
+            raise ValueError("Region too small: give fractions of the view, e.g. x0=0.6 y0=0.4 x1=0.9 y1=0.8")
+        r = pymupdf.Rect(vb[0] + fx0 * (vb[2] - vb[0]), vb[1] + fy0 * (vb[3] - vb[1]),
+                         vb[0] + fx1 * (vb[2] - vb[0]), vb[1] + fy1 * (vb[3] - vb[1]))
+        images = [(f"{view.label} ({view.id}), region x {fx0:.2f}-{fx1:.2f}, y {fy0:.2f}-{fy1:.2f}",
+                   png_of(page, r, long_side=1400))]
+        aligned = []
+        own = view.outline_pt
+        for other in run.views.values():
+            ob = other.outline_pt
+            if other is view or not ob or not other.sheet_box or other.suggested_subagent in ("isometric", "detail"):
+                continue
+            box = pymupdf.Rect(other.sheet_box[0] * w, other.sheet_box[1] * h,
+                               other.sheet_box[2] * w, other.sheet_box[3] * h)
+            y_shared = min(own[3], ob[3]) - max(own[1], ob[1])
+            x_shared = min(own[2], ob[2]) - max(own[0], ob[0])
+            if y_shared > 0.3 * min(own[3] - own[1], ob[3] - ob[1]):    # drawn beside: same heights
+                band, how = pymupdf.Rect(box.x0, r.y0, box.x1, r.y1), "same height"
+            elif x_shared > 0.3 * min(own[2] - own[0], ob[2] - ob[0]):  # drawn above or below: same widths
+                band, how = pymupdf.Rect(r.x0, box.y0, r.x1, box.y1), "same width"
+            else:
+                continue
+            band = band & box
+            if band.is_empty or band.width < 2 or band.height < 2:
+                continue
+            images.append((f"Aligned band in {other.label} ({other.id}): {how} as the region above", 
+                           png_of(page, band, long_side=1400)))
+            aligned.append({"view": other.id, "label": other.label, "shares": how, "axes": other.frame})
+        texts = [s for s in text_spans(page)
+                 if s["bbox"][2] * w >= r.x0 and s["bbox"][0] * w <= r.x1
+                 and s["bbox"][3] * h >= r.y0 and s["bbox"][1] * h <= r.y1]
+    return ToolOutput({"region": images[0][0], "axes": view.frame, "texts_in_region": [s["text"] for s in texts],
+                       "aligned_views": aligned}, images)
+
+
 Millimetres = Annotated[float, "mm along the overlay's axis, as labelled on the overlay image"]
 
 
@@ -406,7 +543,7 @@ def zoom_comparison(ctx: Ctx, h_from: Millimetres, h_to: Millimetres,
 
 
 TOOLS = {f.__name__: f for f in (view_drawing, read_drawing_text, split_views, call_subagent,
-                                 read_view_text, zoom_view, run_cadquery, zoom_comparison)}
+                                 read_view_text, zoom_view, run_cadquery, zoom_comparison, extend_view)}
 JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
 
@@ -494,8 +631,10 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
             try:
                 result = parse_json(message.content or "")
                 if agent.output_model:
-                    result = agent.output_model.model_validate(
-                        result, context={"views": list(run.views)}).model_dump(mode="json")
+                    context = {"views": list(run.views)}
+                    if agent.output_model is schema.ArbiterReport:
+                        context["texts"] = drawing_texts(run)
+                    result = agent.output_model.model_validate(result, context=context).model_dump(mode="json")
             except (ValueError, ValidationError) as error:
                 problem = validation_problems(error)
                 alog.warning("reply rejected, asking for a fix: %s", problem.replace("\n", " | ")[:400])
@@ -587,7 +726,53 @@ def open_run(drawing: Path, run_dir: Path, max_cost_usd: float) -> Run:
     return Run(drawing.resolve(), run_dir.resolve(), client, max_cost_usd=max_cost_usd)
 
 
+AXIS_VECTORS = {"+X": (1, 0, 0), "-X": (-1, 0, 0), "+Y": (0, 1, 0), "-Y": (0, -1, 0), "+Z": (0, 0, 1), "-Z": (0, 0, -1)}
+
+
+def apply_extensions(tree: dict) -> list[str]:
+    """Features that merge into a round body (`extends_into`) run up to that body's axis: compute their height
+    here instead of letting the model guess it. The body's axis passes through its position along its direction;
+    the height is the distance from the feature's start, along the feature's direction, to that axis."""
+    import numpy as np
+
+    by_id = {f["id"]: f for f in tree["features"]}
+    notes = []
+    for f in tree["features"]:
+        target_id = f.get("extends_into")
+        if not target_id:
+            continue
+        target = by_id.get(target_id)
+        d = AXIS_VECTORS.get(f.get("direction") or "")
+        if target is None or f.get("position") is None or d is None:
+            notes.append(f"{f['id']}: extends_into {target_id} needs this feature's position and direction")
+            continue
+        axis = AXIS_VECTORS.get(target.get("direction") or "")
+        if "d" not in target["params"] or target.get("position") is None or axis is None:
+            notes.append(f"{f['id']}: extends_into {target_id} needs a round body (d, position on its axis, direction)")
+            continue
+        d, axis = np.array(d, float), np.array(axis, float)
+        if abs(float(np.dot(d, axis))) > 1e-6:
+            notes.append(f"{f['id']}: it runs along {target_id}'s axis, so it cannot rise to it")
+            continue
+        start, centre = np.array(f["position"], float), np.array(target["position"], float)
+        height = round(float(np.dot(centre - start, d)), 3)
+        if height <= 0:
+            notes.append(f"{f['id']}: {target_id}'s axis is behind its start face ({height:g} mm)")
+            continue
+        old = f["params"].get("height")
+        f["params"]["height"] = height
+        i = int(np.argmax(np.abs(d)))
+        f["evidence"] = [e for e in f["evidence"] if e["role"] != "height"] + [{
+            "view": "notes", "text": f"extends into {target_id}", "role": "height",
+            "derived": f"up to the axis of {target_id} ({target['name']}): {'XYZ'[i]} {centre[i]:g} - {start[i]:g}"}]
+        notes.append(f"{f['id']}.height = {height:g} mm, up to the axis of {target_id}" +
+                     (f" (the plan said {old:g})" if isinstance(old, (int, float)) and old != height else ""))
+    return notes
+
+
 def save_plan(run: Run, result: dict) -> dict:
+    for note in apply_extensions(result["feature_tree"]):
+        log.info("  extension: %s", note)
     (run.dir / "feature_tree.json").write_text(json.dumps(result["feature_tree"], indent=2, ensure_ascii=False),
                                                encoding="utf-8")
     (run.dir / "plan.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -604,7 +789,7 @@ def plan(run: Run) -> dict:
     """Main agent + view subagents -> feature tree (feature_tree.json, plan.json)."""
     content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}. Start with step 1."}]
     result = run_agent(load_agent("main"), Ctx(run), content)
-    return save_plan(run, {**result, "summaries": run.summaries})
+    return save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check})
 
 
 def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | None, round_no: int) -> dict:
@@ -630,9 +815,13 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
             "## Issues to fix\n```json\n" + json.dumps(issues, indent=1, ensure_ascii=False) + "\n```\n\n"
             + ("## Orientation check\n```json\n" + json.dumps(pose, indent=1) + "\n```\n\n" if pose else "")
             + "## Your current plan\n```json\n" + json.dumps(current, indent=1, ensure_ascii=False) + "\n```\n\n"
-            "## View summaries\n```json\n" + json.dumps(summaries, indent=1, ensure_ascii=False) + "\n```")
+            "## View summaries\n```json\n" + json.dumps(summaries, indent=1, ensure_ascii=False) + "\n```"
+            + ("\n\n## Cross-check rulings (settled from the drawing; they override the summaries)\n```json\n"
+               + json.dumps(plan_result["cross_check"].get("rulings", []), indent=1, ensure_ascii=False) + "\n```"
+               if (plan_result.get("cross_check") or {}).get("rulings") else ""))
     result = run_agent(agent, Ctx(run), [{"type": "text", "text": text}], label=f"main[revision {round_no}]")
-    return save_plan(run, {**result, "summaries": plan_result.get("summaries", [])})
+    return save_plan(run, {**result, "summaries": plan_result.get("summaries", []),
+                           "cross_check": plan_result.get("cross_check")})
 
 
 def build(run: Run, plan_result: dict, corrections: dict | None = None) -> dict:
@@ -731,7 +920,8 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
                 + json.dumps(measured, indent=1, ensure_ascii=False) + "\n```\n\n"
                 "## Pose check (all views together)\n```json\n" + json.dumps(data.get("pose"), indent=1) + "\n```\n\n"
                 "## Feature tree the model was built from\n```json\n"
-                + json.dumps({"frame": tree["frame"], "features": compact}, indent=1, ensure_ascii=False) + "\n```")
+                + json.dumps({"frame": tree["frame"], "features": compact,
+                              "assumptions": tree.get("assumptions", [])}, indent=1, ensure_ascii=False) + "\n```")
         content = [{"type": "text", "text": text}]
         for key, caption in (("drawing", "The drawing view:"), ("model", "The model projection, same direction:"),
                              ("overlay", "Overlay (drawing black, model red; orange = drawn but missing, "
@@ -795,6 +985,23 @@ def weigh_by_evidence(report: dict, entry: dict, vlog: logging.Logger) -> dict:
     return {**report, "issues": issues, "verdict": verdict}
 
 
+def issue_key(issue: dict) -> tuple:
+    return issue.get("feature"), issue["kind"]
+
+
+def escalate(issues: list[dict], sent_to: dict):
+    """Issues that come back after a correction round. A build issue the builder did not fix is usually a plan
+    problem it cannot solve (the tree or an assumption says otherwise): send it to the planner this time."""
+    for issue in issues:
+        key = issue_key(issue)
+        if issue["severity"] != "high" or key not in sent_to:
+            continue
+        if sent_to[key] == "build" and issue["owner"] == "build":
+            issue["owner"] = "plan"
+            issue["description"] += " (Escalated: this survived a build correction, so the plan must change.)"
+            log.info("    escalated to the planner: %s %s", issue.get("feature") or "-", issue["kind"])
+
+
 def round_rank(r: dict):
     """Best round first: fewest high-severity issues, then the best measured fit, then the latest."""
     return r["high_issues"], -r["drawn_covered"], -r["round"]
@@ -820,6 +1027,7 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     log.info("run %s: %s with %s", run.dir.name, drawing, MODEL)
     started = time.monotonic()
     rounds, report, corrections = [], {"status": "failed"}, None
+    sent_to = {}  # issue key -> owner it was sent to in the last correction round
     try:
         if rebuild:
             run.trace("rebuild_start")
@@ -831,6 +1039,7 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
                 break
             check = validate(run, plan_result, round_no)
             issues = [i for r in check["reports"] for i in r["issues"]]
+            escalate(issues, sent_to)
             high = [i for i in issues if i["severity"] == "high"]
             covered = [m["drawn_covered"] for m in check["measured"]]
             rounds.append({"round": round_no, "build": report["status"], "high_issues": len(high),
@@ -848,6 +1057,7 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
                             len(high), round_no - 1)
                 break
             plan_issues = [i for i in issues if i["owner"] == "plan"]
+            sent_to = {issue_key(i): i["owner"] for i in issues if i["severity"] == "high"}
             log.info("correction round %d: %d plan issue(s), %d build issue(s)", round_no, len(plan_issues),
                      len(issues) - len(plan_issues))
             if plan_issues:

@@ -12,6 +12,9 @@ output_schema: SectionSummary   # pydantic model in src/schema.py
 
 You analyse a **section view** of one engineering drawing (e.g. `SECTION A-A`). You receive only this view, cropped from the sheet, the text found inside it, and, when available, the cutting-plane line it comes from in another view. Another agent will combine your output with the other views to build the 3D part. Section views are where internal geometry is defined, so this view is often the most important one.
 
+**Axes:** when the input gives this view's axes ("image right = ..., image up = ..."), those signs are worked out from the drawing itself (labels, sheet layout, cut-line arrows). Use them for every position and direction you report, and set `horizontal`/`vertical` from them; they take precedence over the general description below. Positions are in the part frame: say, for example, "pad centred at +Z 18, measured from the bottom face".
+
+
 # How to read a section
 
 - The part has been cut along the cutting plane and the near half removed. You see the cut face.

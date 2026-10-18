@@ -4,7 +4,8 @@ description: Compares the built model with the isometric view of the drawing and
 model: openai/gpt-6-luna
 temperature: 0.1
 max_turns: 5
-tools: []
+tools:
+  - zoom_comparison   # the same region of the drawing view and of the model projection, side by side
 output_schema: ValidationReport   # pydantic model in src/schema.py
 ---
 
@@ -22,11 +23,11 @@ The harness has already built the model and projected it into this view's frame,
 6. **Pose check**: which of the 24 axis-aligned turns of the model best matches all views. If it is not the model as built, the model is turned or mirrored relative to the drawing.
 7. **The feature tree** the model was built from, so you can name the feature at fault.
 
-This view is pictorial: there is no overlay, no metrics and no zoom tool. Compare the drawing view and the model render by eye.
+When the input has **metrics and an overlay**, the harness fitted the isometric camera to the drawn edges: judge this view like any measured view, from the metrics, the missing/extra regions and `zoom_comparison`. Hidden steps and supports that no orthographic view shows are often visible here. Without metrics the camera could not be fitted: compare the drawing view and the model render by eye, and report sizes only for gross differences.
 
 # What to look at in this view
 
-- **Shape only, no dimensions.** The model projection is a matching isometric render.
+- **Shape first.** Without metrics, report no dimensions; with metrics, the regions give positions in mm along the overlay's axes.
 - Is every feature drawn present in the model (holes, slots, bosses, cross holes, fillets)? Is anything in the model that the drawing does not show?
 - **Which end is which**: the flange, the boss, the open side of a slot must be on the same side as in the drawing. This is where a mirrored part is easiest to see.
 - Report sizes only as wrong_size issues with low confidence, and only for gross differences (a feature clearly much taller or thinner).
@@ -39,11 +40,12 @@ This view is pictorial: there is no overlay, no metrics and no zoom tool. Compar
   - `kind`: missing, extra, wrong_size, wrong_position or wrong_orientation;
   - `drawing` and `model`: what each shows, quoting the dimension text exactly;
   - `feature`: the id at fault, or null if the drawing shows something no feature covers;
-  - `owner`: **plan** if the feature tree itself disagrees with the drawing (wrong value, wrong position, wrong end, missing feature); **build** if the tree is right and the model does not follow it. Compare the tree's params with the drawing before you choose;
+  - `owner`: **plan** if the feature tree itself disagrees with the drawing (wrong value, wrong position, wrong end, missing feature); **build** if the tree is right and the model does not follow it. Compare the tree's params **and its assumptions** with the drawing before you choose: an assumption that narrows or contradicts a callout (e.g. `THRU` read as "through the flange only") makes the issue the **plan**'s, even when a param such as `thru: true` looks right. A failing callout check (count, depth, `THRU`) that the tree's assumptions explain is a plan issue;
   - `fix`: the concrete change, e.g. `F02.height: 3 -> 40 (support rises to the barrel axis)`;
   - `severity`: **high** if it changes the shape or a dimension; **low** for drafting conventions (thread lines, tangent edges, a hidden line the drafter left out).
 - **Orientation**: the **pose check** decides whether the part is mirrored or turned; it scores every view together. Report `wrong_orientation` (one issue, on the features at the wrong end) only when the pose check says another orientation fits clearly better. Otherwise a feature that looks like it is on the other side in this view is a wrong position or size, or a drafting difference: describe what you see, and never ask to move features to the other side. The harness drops wrong_orientation issues the pose check does not confirm.
 - **Sections**: the input says which view the section is cut from and where (`parent_view`, `cut_offset_mm`). If it carries a `side_note`, left and right in this section may be swapped: do not report on which side anything is.
+- **Merging features**: if a support, web, rib, gusset or boss that meets another body looks too short, the fix is to run it **into** that body, up to the body's axis or centre for a cylinder, or its far face for a wall (the union trims it). For a round body, write the fix as `<feature>.extends_into = <id of the body>`; the harness then computes the height. Do not give a size taken from where its edges disappear behind another feature, and do not ask for a sloped or shaped profile unless an orthographic view draws one: in an isometric, edges along X and Y are drawn at 30°, so a straight horizontal edge looks inclined.
 - `verdict`: **pass** with no high-severity issue, **minor** with only low-severity issues, **fail** with at least one high-severity issue.
 - `confidence`: how sure you are of the verdict. Lower it when the view is small, crowded, or a scan.
 

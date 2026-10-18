@@ -31,7 +31,7 @@ Call `view_drawing` to look at the full sheet, and `read_drawing_text` to get it
 
 Call `split_views`. It finds every view on the sheet and returns, for each one, an id, its type (front, top, side, section, detail, isometric), its label as written on the sheet, and its saved image.
 
-Check the result against the full sheet: every view you saw in step 1 should be there. If a view is missing or has the wrong type, say so in `uncertainties`.
+Check the result against the full sheet: every view you saw in step 1 should be there. Each view also comes with its `axes` in the part frame (image right, image up, viewing direction), worked out from the labels, the sheet layout and the cut-line arrows. **Use these signs; do not re-derive them.** Which end of the part a feature sits on follows from them: in a view whose image right is −Y, a leg drawn on the left is at +Y. Pass each view's axes to its subagent in `context` only if they are missing. If a view is missing or has the wrong type, say so in `uncertainties`.
 
 ## 3. Analyse each view
 
@@ -40,6 +40,9 @@ For **each view returned by `split_views`**, call `call_subagent` with the subag
 Give the side and section subagents the context they cannot see in their own crop: the projection type, and for a section, the cutting-plane line and the view it is drawn in.
 
 ## 4. Group the analyses
+
+**Cross-check first.** When the last view analysis comes back, its result carries a `cross_check`: the places where the view analyses disagree, guess, or leave dimensions unexplained, and the arbiter's ruling on each, settled from the drawing. A `resolved` ruling **overrides** the view summaries: use its fact and values, and cite its quoted evidence. An `already_covered` ruling needs no change. An `unresolved` one becomes an assumption, with the arbiter's most plausible reading.
+
 
 Each subagent returns a view summary: its dimensions, its feature **hypotheses** (with evidence and a confidence), and what it `cannot_tell`. A feature rarely belongs to one view: a cross hole is a circle in the side view, two hidden lines in the front view, and its position comes from a dimension in a third place. Combine the summaries into one picture of the part:
 
@@ -84,11 +87,17 @@ Write **one feature tree for the whole part**, in the order a CAD modeller would
 - `checks`: how to verify it once built: `bbox`, `volume`, `projection:<view ids>`, `cylinder:d=6.6,count=4,thru`, `count:<what>=<n>`.
 - `state`: always `not_started`.
 
-Order: base body first (one extrude of the main outline, or one revolve for a turned part); then added material; then removed material, a feature always after the one whose face it starts from; fillets and chamfers last.
+Order: base body first (one extrude of the main outline, or one revolve for a turned part); then added material, **each new solid touching what comes before it** (a support right after the plate it stands on, before the barrel it carries and extends into); then removed material, a feature always after the one whose face it starts from; fillets and chamfers last.
 
 Frame: Z is up, the face the part rests on is at Z = 0, and the part is centred on X and Y about its main axis or symmetry centrelines. For a turned part, the axis of revolution is Z. Describe this in `frame`.
 
+**Merging features extend into what they join.** A support, pedestal, web, rib, gusset or boss that meets another body (a barrel, a wall, a curved face) does not stop where its edges become hidden, nor where they meet the other body's outline. Model it **into** that body: up to the body's axis or centre for a cylinder, up to the far face for a wall. The union removes the part inside, and the visible outline comes out right by itself. Its size then needs no guess. **When the body is round** (a barrel, a boss, a cylinder), set `extends_into` to that body's feature id and leave the height out: the harness computes it from the feature's `position` and `direction` up to the body's axis (a block standing on a plate top at Z = 9 under a barrel whose axis is at Z = 49 gets height 40). For that, give the round body a `position` on its axis and its `direction`. When the body is flat (a wall, a plate), give the height up to its far face yourself, with the dimensions that place that face as evidence. Either way, record the choice as an assumption that names this rule.
+
 **Cross holes and depths.** A radial or cross hole that meets a bore ("opens into the bore", or drawn running into it) must reach **at least the bore's axis**: never set its depth to *outer radius − bore radius*, which only touches the bore along one line and leaves a wall. Look for the depth on the sections: a small dimension between the hole's end and a centreline is how far it goes past the axis (depth = distance to the axis + that value); a full V of 45° lines at the axis means equal-diameter holes meet there. If no view gives it, take the depth to the axis and record that as an assumption.
+
+**Callouts are not negotiable.** An assumption may fill a gap the drawing leaves; it may never narrow or contradict an explicit callout. `THRU` means through every wall the hole's axis crosses, not only the first one; `4x` means four; a stated depth is the depth. If a callout looks impossible or ambiguous to you, follow it and put your doubt in `uncertainties`.
+
+**Round outlines are circles.** A feature dimensioned with `Ø` (a barrel, flange, boss, bore) has a circular profile: give `d` and `profile: "circle"`, never a list of polygon points approximating it.
 
 **Every number needs a source.** A value with no evidence must be covered by an assumption (`A1`, `A2`, ... with `covers: ["F03.depth"]`); the harness rejects a tree with an uncovered number. A feature that no operation can express (gear teeth, sheet-metal bends, engraving) goes in `unsupported`, not in the tree.
 

@@ -190,6 +190,9 @@ class Feature(Strict):
     direction: Axis | None = Field(None, description="Extrude, hole or revolve axis direction")
     long_axis: Axis | None = Field(None, description="Slots and obround profiles: the direction their length runs")
     pattern: Pattern | None = None
+    extends_into: str | None = Field(None, pattern=r"^F\d{2}$", description="Id of the round body this feature "
+                                     "merges into (a support under a barrel, a boss on a cylinder): the harness then "
+                                     "computes its height up to that body's axis; leave the height out")
     placements: list[Placement] = Field(default_factory=list, description="Every instance with its own "
                                         "position, when the copies are not a regular pattern; then leave "
                                         "`position` and `pattern` empty")
@@ -217,6 +220,8 @@ class Feature(Strict):
         missing = []
         for need in REQUIRED_PARAMS.get(self.op, []):
             options = need if isinstance(need, tuple) else (need,)
+            if self.extends_into and options == ("height",):
+                continue  # computed by the harness up to the body it merges into
             if not any(o in self.params for o in options):
                 missing.append(" or ".join(options))
         if missing:
@@ -278,8 +283,12 @@ class FeatureTree(Strict):
                 errors.append(f"{f.id} position has no evidence with role 'position' (quote the dimensions that "
                               f"locate it and, in `derived`, the face they are measured from) and no assumption "
                               f"covering '{f.id}.position'")
+        ids = {f.id for f in self.features}
+        for f in self.features:
+            if f.extends_into and (f.extends_into not in ids or f.extends_into == f.id):
+                errors.append(f"{f.id}.extends_into = {f.extends_into}: there is no other feature with that id")
         for f in self.features:  # every number needs a source
-            roles = {e.role for e in f.evidence}
+            roles = {e.role for e in f.evidence} | ({"height"} if f.extends_into else set())
             for key, value in f.params.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool) \
                         and key not in roles and f"{f.id}.{key}" not in covered:
@@ -356,7 +365,44 @@ class ValidationReport(Strict):
         return self
 
 
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", "", text.upper().replace("⌀", "Ø").replace("∅", "Ø"))
+
+
+class Ruling(Strict):
+    """The arbiter's decision on one cross-check item."""
+    item: str = Field(pattern=r"^C\d+$", description="The item id, e.g. C3")
+    decision: Literal["resolved", "already_covered", "unresolved"] = Field(
+        description="resolved: you settled it from the drawing; already_covered: another view's hypothesis already "
+                    "describes it (say which); unresolved: the drawing does not settle it")
+    fact: str = Field(description="The settled fact in part axes, precise enough to model from, e.g. 'support block: "
+                                  "X -34..34 (68), Y -18..18 (36), from the plate top Z=9 up into the barrel'")
+    values: dict[str, float] = Field(default_factory=dict, description="Named values, e.g. {'support.size_x': 68}")
+    evidence: list[str] = Field(default_factory=list, description="Drawing text exactly as printed that proves it")
+    views: list[str] = Field(default_factory=list, description="View ids you checked")
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def quotes_the_drawing(self, info: ValidationInfo) -> Ruling:
+        texts = (info.context or {}).get("texts")
+        if self.decision == "resolved" and not self.evidence:
+            raise ValueError(f"{self.item}: a resolved item must quote the drawing text that proves it")
+        if texts and self.evidence:
+            sheet = [_flat(x) for x in texts]
+            missing = [e for e in self.evidence if not any(_flat(e) in s or s in _flat(e) for s in sheet)]
+            if missing:
+                raise ValueError(f"{self.item}: evidence {missing} is not text on the drawing; quote dimensions and "
+                                 f"callouts exactly as printed (read_drawing_text lists them)")
+        return self
+
+
+class ArbiterReport(Strict):
+    """The arbiter's answer: one ruling per cross-check item."""
+    rulings: list[Ruling]
+    notes: list[str] = Field(default_factory=list)
+
+
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
-    FeatureTree, PartPlan, BuildReport, ValidationReport,
+    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport,
 )}
