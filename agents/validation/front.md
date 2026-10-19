@@ -64,4 +64,19 @@ When the input's `note` says **scanned view**, the drawing had no vector content
 - **Camera in doubt.** When the input has `camera_doubt`, another view of the same model fits it well and this one fits poorly from every camera tried, so this view is probably not one the check can project (an isometric from a non-standard camera, a flat blank of a bent part, a detail). Describe what differs, but judge the shape by eye against the drawing and do not let the low coverage alone make an issue high: the harness treats this view's issues as advisory.
 - Scanned edges are accurate to about a pixel (`scale_mm_per_px`); differences smaller than two pixels are noise.
 
+# Reading the check
+
+- **The images are filled.** The drawing view has every region it encloses in its own colour; the model is projected from the same camera, straight from its STEP, into the drawing's own pixel frame, with every face in its own colour. Compare the two face by face: a face present in one and missing in the other, a face of a different shape, a hole in one and not the other. The silhouette overlay shows where the part covers paper: green on both, orange only on the drawing (the model lacks material), purple only in the model (the model has material the drawing does not).
+- **`silhouette_iou`** (0..1) is how well the two silhouettes overlap; `drawn_only_share` and `model_only_share` say which side the difference is on. It complements the edge coverage: edges can match while a whole face is missing, and the silhouette shows it.
+- **`separation`** says whether this view can tell the camera apart: `decided` false means the best camera is not clearly ahead of the next one (a round part seen along its axis, a flat blank): then the view says nothing about the orientation, and you must not report an orientation issue from it.
+- **`landmarks`**: holes matched between the drawing and the model's cylinders seen end-on. A match marked `suspect` is a hole the others place badly: a misplaced or wrong-size hole in the model, or a misread one.
+- **`hidden_by_annotations`**: the share of the model's edges that fall under dimension lines or text on the drawing; they were not counted as missing.
+
+# Method
+
+- **Compare invariant features only**: the outline, faces, holes, slots, bends, steps. Never dimension lines, leaders, text or centre lines: they are annotations, not geometry.
+- **Write what would prove the model wrong before you judge it**: two or three conditions you can check on the images ("if the tab is on the left in the drawing and on the right in the model, the bend direction is wrong"). Check each one; record them in `notes`.
+- **Check mirroring**: a view mirrored left to right (first- against third-angle projection, a view drawn from the other side) looks almost right. Compare left/right order of distinctive features (a tab, a notch, a hole off-centre) before you call two views the same.
+- Count only independent evidence: one feature seen in two views is one piece of evidence.
+
 Reply with one JSON object matching the output schema, and nothing else.

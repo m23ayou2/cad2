@@ -57,7 +57,7 @@ import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 MODEL = "openai/gpt-6-luna" 
-# MODEL = "anthropic/claude-haiku-5.5" 
+MODEL = "nvidia/nemotron-3.5-super-vl" #"anthropic/claude-haiku-5.5" 
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -653,6 +653,13 @@ def scan_view(ctx: Ctx, x0: SheetFraction, y0: SheetFraction, x1: SheetFraction,
                     "false panels). set_dimension_values gives all of it in mm; then trace_outline turns the traced "
                     "outline into exact lines and arcs, using the corner ids V1.. on the outline image."}}
            if flat_blank else {})
+        | ({"panel_face_candidates": raster_vector.pair_panels_with_faces(
+                next(sc["blank"]["panels"] for sc in run.scans.values() if (sc.get("blank") or {}).get("panels")),
+                view_faces["faces"]),
+            "panel_face_note": "For each panel of the blank traced earlier, the faces of this view most like it "
+                               "(holes, convexity, area share): hints to check by eye, not matches"}
+           if view_faces.get("faces") and any((sc.get("blank") or {}).get("panels") for sc in run.scans.values())
+           else {})
         | ({"faces": view_faces["faces"],
             "faces_note": "Each region the view's edges enclose is a face of the part (F1 = the largest); 'touches' "
                           "lists the faces it meets. On a formed part, match the blank's panels to these faces: which "
@@ -674,6 +681,10 @@ def check_corners(run: Run, scan_id: str, gray: np.ndarray, flat_blank: dict):
     overview = raster_vector.corner_image(gray, flat_blank["contour"], corners)
     overview = overview[max(0, 2 * y - 40):2 * (y + h) + 40, max(0, 2 * x - 60):2 * (x + w) + 60]
     grid = raster_vector.corner_patches(gray, flat_blank["contour"], corners)
+    folder = run.dir / "scans" / scan_id
+    folder.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(folder / "corners_overview.png"), overview)
+    cv2.imwrite(str(folder / "corners_closeups.png"), grid)
     content = [{"type": "text", "text": f"Scan {scan_id}: {len(corners)} traced corners, {', '.join(ids)}. "
                                         "Judge every one."},
                {"type": "text", "text": "Overview:"}, image_part(cv2.imencode(".png", overview)[1].tobytes()),
@@ -695,6 +706,8 @@ def check_corners(run: Run, scan_id: str, gray: np.ndarray, flat_blank: dict):
     log.info("corner check %s: %d of %d corners dropped as artifacts: %s", scan_id, len(dropped), len(ids),
              "; ".join(dropped) or "none")
     run.trace("corner_check", scan=scan_id, verdicts=answer["corners"], dropped=dropped)
+    (folder / "corner_check.json").write_text(json.dumps({"verdicts": answer["corners"], "dropped": dropped},
+                                                         indent=1, ensure_ascii=False), encoding="utf-8")
 
 
 def crop_grid(crops: list, max_width: int = 2400) -> np.ndarray:
@@ -903,6 +916,10 @@ def trace_outline(ctx: Ctx, scan: Annotated[str, "The scan id of a flat blank (s
     bad = [f"{e.get('from', e.get('corner'))}->{e.get('to', '')}" for e in fit["report"] if not e["ok"]]
     log.info("outline %s: %d piece(s), area %.0f mm2, not ok: %s", scan, len(fit["pieces"]), area, bad or "none")
     run.trace("outline_fit", scan=scan, spans=json.loads(spans), report=fit["report"])
+    calls = len(list(Path(s["folder"]).glob("outline_fit_*.png"))) + 1
+    cv2.imwrite(str(Path(s["folder"]) / f"outline_fit_{calls}.png"), img)
+    (Path(s["folder"]) / f"outline_fit_{calls}.json").write_text(json.dumps(
+        {"spans": json.loads(spans), "fits": fit["report"], "area_mm2": round(area, 1)}, indent=1), encoding="utf-8")
     return ToolOutput({"scan": scan, "fits": fit["report"], "not_ok": bad, "outline": outline, "profile": profile,
                        "area_mm2": round(area, 1),
                        "note": "Frame as blank_mm (origin at the blank's lower-left corner, x right, y up). on_edge: "
@@ -1370,6 +1387,7 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
                                                 if entry.get("cut_plane_normal") else "") + ".")
         measured = {k: entry.get(k) for k in ("metrics", "missing_regions", "extra_regions", "callouts", "note",
                                               "class", "camera", "scale_mm_per_px", "orientation", "camera_doubt",
+                                              "separation", "landmarks",
                                               "parent_view", "cut_offset_mm", "side_note", "orientation_note",
                                               "direction_note")
                     if entry.get(k) is not None}
@@ -1381,12 +1399,27 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
                 + json.dumps({"frame": tree["frame"], "features": compact,
                               "assumptions": tree.get("assumptions", [])}, indent=1, ensure_ascii=False) + "\n```")
         content = [{"type": "text", "text": text}]
-        for key, caption in (("drawing", "The drawing view:"), ("model", "The model projection, same direction:"),
-                             ("overlay", "Overlay (drawing black, model red; orange = drawn but missing, "
-                                         "purple = in model but not drawn):")):
+        filled = str(entry["images"].get("drawing", "")).endswith("_filled.png")
+        captions = ((("drawing", "The drawing view, every region it encloses filled in its own colour:"),
+                     ("model", "The model, projected from the same camera straight from its STEP and drawn in the "
+                               "drawing's own pixel frame, every face filled in its own colour:"),
+                     ("overlay", "Silhouettes over the drawing: green = both, orange = drawn but not in the model, "
+                                 "purple = in the model but not drawn; the model's edges in purple lines:"),
+                     ("matches", "Match sheet: drawing (left) and model (right), one line per hole matched between "
+                                 "them; red = a suspect match:"))
+                    if filled else
+                    (("drawing", "The drawing view:"), ("model", "The model projection, same direction:"),
+                     ("overlay", "Overlay (drawing black, model red; orange = drawn but missing, "
+                                 "purple = in model but not drawn):")))
+        for key, caption in captions:
             if key in entry["images"]:
                 content += [{"type": "text", "text": caption},
                             image_part(Path(entry["images"][key]).read_bytes())]
+        # what this validator is given: its text, and which images (in this folder) follow it
+        (out_dir / f"{view.id}.input.md").write_text(
+            text + "\n\n## Images shown\n" + "\n".join(f"- {caption} `{Path(entry['images'][key]).name}`"
+                                                       for key, caption in captions if key in entry["images"]),
+            encoding="utf-8")
         try:
             report = run_agent(load_agent(f"validation/{kind}"), Ctx(run, view, entry), content,
                                label=f"validation/{kind}[{view.id}]")
@@ -1584,6 +1617,7 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
                            "issues": [i for i in issues if i["owner"] == "build"],
                            "previous_script": (run.dir / "model.py").read_text(encoding="utf-8")}
         keep_best_round(run, rounds)
+        red_team = red_team_review(run, rounds)
     except Exception as error:
         run.trace("run_end", ok=False, error=f"{type(error).__name__}: {error}", cost_usd=run.cost_usd)
         log.error("run failed after %.1fs, cost $%.4f: %s", time.monotonic() - started, run.cost_usd, error)
@@ -1604,6 +1638,7 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
         "viewer": "viewer.html" if (run.dir / "viewer.html").is_file() else None,
         "build_attempts": run.build_attempts, "seconds": seconds,
         "cost_usd": run.cost_usd, "calls_without_cost": run.cost_unknown_calls,
+        "red_team": red_team,
     }, indent=2), encoding="utf-8")
     run.trace("run_end", ok=True, status=report["status"], rounds=rounds, cost_usd=run.cost_usd, seconds=seconds)
     unknown = f" (+{run.cost_unknown_calls} call(s) with no reported cost)" if run.cost_unknown_calls else ""
@@ -1637,6 +1672,50 @@ def keep_best_round(run: Run, rounds: list[dict]):
     log.warning("keeping round %d (%d high issue(s)): the later rounds were not better", best["round"],
                 best["high_issues"])
     write_viewer(run)
+
+
+def red_team_review(run: Run, rounds: list[dict]) -> dict | None:
+    """A last, advisory pass: an agent that sees the sheet, the kept model's filled comparison images and its tree,
+    and argues the model is wrong. Its objections are saved (red_team.json) and reported; they start no round."""
+    if not rounds or not (run.dir / "feature_tree.json").is_file():
+        return None
+    best = min(rounds, key=round_rank)
+    folder = run.dir / "validation" / f"round_{best['round']}"
+    try:
+        data = json.loads((folder / "validation.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {"views": []}
+    with pymupdf.open(run.drawing) as doc:
+        sheet = png_of(doc[0])
+    content = [{"type": "text", "text": "The drawing sheet:"}, image_part(sheet)]
+    for e in data["views"][:6]:
+        images = e.get("images") or {}
+        if not images:
+            continue
+        numbers = {k: e.get(k) for k in ("metrics", "separation", "camera") if e.get(k) is not None}
+        content.append({"type": "text", "text": f"View {e['view_id']} ({e.get('label')}), check: "
+                                                + json.dumps(numbers, ensure_ascii=False)})
+        for key in ("drawing", "model", "overlay"):
+            if key in images and Path(images[key]).is_file():
+                content += [{"type": "text", "text": f"{e['view_id']} {key}:"},
+                            image_part(Path(images[key]).read_bytes())]
+    tree = json.loads((run.dir / "feature_tree.json").read_text(encoding="utf-8"))
+    content.append({"type": "text", "text": "Feature tree:\n```json\n" + json.dumps(
+        {"frame": tree.get("frame"), "features": [{k: f.get(k) for k in ("id", "name", "op", "params", "position",
+                                                                         "direction", "placements")}
+                                                  for f in tree.get("features", [])]}, ensure_ascii=False) + "\n```"})
+    try:
+        report = run_agent(load_agent("red_team"), Ctx(run), content, label="red_team")
+    except Exception as error:
+        log.warning("red team review failed: %s", error)
+        return None
+    (run.dir / "red_team.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    for o in report["objections"]:
+        log.warning("red team [%s/%s] %s: %s", o["severity"], o["kind"], o.get("feature") or "-", o["claim"])
+    if report["verdict"] == "no_objection":
+        log.info("red team: no objection")
+    return {"verdict": report["verdict"], "objections": len(report["objections"]),
+            "high": sum(o["severity"] == "high" for o in report["objections"]), "file": "red_team.json"}
 
 
 def main():

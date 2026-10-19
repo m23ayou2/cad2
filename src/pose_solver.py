@@ -90,8 +90,9 @@ def view_basis(look, up):
     return np.array([right, up, -look])       # rows: model -> (x right, y up, z towards viewer)
 
 
-def project_edges(shape, step=0.1):
-    """Visible edges of `shape` seen from +Z (camera at +Z looking -Z), as 2D points (mm)."""
+def project_edges(shape, step=0.1, polylines=False):
+    """Visible edges of `shape` seen from +Z (camera at +Z looking -Z), as 2D points (mm), or with `polylines` as
+    one polyline per edge (to draw them as continuous lines)."""
     algo = HLRBRep_Algo()
     algo.Add(shape)
     algo.Projector(HLRAlgo_Projector(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0))))
@@ -107,14 +108,18 @@ def project_edges(shape, step=0.1):
             c = BRepAdaptor_Curve(TopoDS.Edge_s(ex.Current()))
             u0, u1 = c.FirstParameter(), c.LastParameter()
             n = max(2, int(GCPnts_AbscissaPoint.Length_s(c) / step) + 1)
-            for k in range(n + 1):
-                p = c.Value(u0 + (u1 - u0) * k / n)
-                pts.append((p.X(), p.Y()))
+            edge = [(c.Value(u0 + (u1 - u0) * k / n).X(), c.Value(u0 + (u1 - u0) * k / n).Y()) for k in range(n + 1)]
+            if polylines:
+                pts.append(np.array(edge))
+            else:
+                pts += edge
             ex.Next()
+    if polylines:
+        return pts
     return np.array(pts) if pts else np.zeros((0, 2))
 
 
-def model_view_points(shape, spec):
+def model_view_points(shape, spec, polylines=False):
     """spec = dict(look, up, cut_normal=None, cut_offset=0) applied in the *drawing* frame.
     cut_offset: mm from the model's centre along the cut normal, where the cutting plane lies."""
     lo, hi = bbox(shape)
@@ -141,7 +146,7 @@ def model_view_points(shape, spec):
         else:
             raise ValueError("the section cut failed: the cutting plane removed no material")
     shape = transform(shape, view_basis(spec["look"], spec["up"]))
-    return project_edges(shape)
+    return project_edges(shape, polylines=polylines)
 
 
 # ------------------------------------------------------------------ drawing side

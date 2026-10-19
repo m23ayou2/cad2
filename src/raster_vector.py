@@ -399,6 +399,7 @@ def blank(gray: np.ndarray, sep: dict, leaders: list[dict]) -> dict:
     for lab in panels:
         inside_pt = deepest_point(labels == lab)
         panel_info.append({"id": pid[lab], "area_px": int(stats[lab, 4]), "inside": inside_pt,
+                           "shape": shape_descriptor(labels == lab),
                            "bends": [b["id"] for b in bends if pid[lab] in b["panels"]]})
     image = label_image(gray, [labels == lab for lab in panels], [pid[lab] for lab in panels],
                         [(np.array(b["from"]), np.array(b["to"]), f"{b['id']}: {b['panels'][0]}|{b['panels'][1]}")
@@ -438,6 +439,42 @@ def label_image(gray: np.ndarray, masks: list, ids: list[str], lines: list = ())
     return img
 
 
+def shape_descriptor(mask: np.ndarray) -> dict:
+    """What survives an isometric view of a flat region (an affine distortion): its solidity (area over its convex
+    hull's, 1 for a convex shape), and how many holes it has. For pairing a blank's panels with an isometric's faces."""
+    m = mask.astype(np.uint8)
+    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return {"solidity": 0.0, "holes": 0}
+    outer = max(range(len(contours)), key=lambda i: cv2.contourArea(contours[i]))
+    hull = cv2.contourArea(cv2.convexHull(contours[outer])) or 1.0
+    area = float(m.sum())
+    def round_opening(c):     # a hole (an ellipse in an isometric), not a pocket a leader or centre line encloses
+        a, perim = cv2.contourArea(c), cv2.arcLength(c, True)
+        return a > 0.002 * area and perim > 0 and 4 * math.pi * a / perim ** 2 >= 0.6
+    holes = sum(1 for i in range(len(contours)) if hierarchy[0][i][3] == outer and round_opening(contours[i]))
+    return {"solidity": round(area / hull, 3), "holes": int(holes)}
+
+
+def pair_panels_with_faces(panels: list[dict], faces_list: list[dict], top: int = 3) -> dict:
+    """For each blank panel, the isometric faces most like it: same number of holes, close solidity, and a similar
+    share of the total area (weighted least: foreshortening changes it). Hints for a vision model, not a decision."""
+    if not panels or not faces_list:
+        return {}
+    pa = sum(p["area_px"] for p in panels) or 1
+    fa = sum(f["area_px"] for f in faces_list) or 1
+    out = {}
+    for p in panels:
+        d = []
+        for f in faces_list:
+            cost = (2.0 * abs(p["shape"]["solidity"] - f["shape"]["solidity"])
+                    + 0.5 * abs(p["shape"]["holes"] - f["shape"]["holes"])
+                    + 0.5 * abs(p["area_px"] / pa - f["area_px"] / fa))
+            d.append((round(cost, 3), f["id"]))
+        out[p["id"]] = [fid for _, fid in sorted(d)[:top]]
+    return out
+
+
 def faces(gray: np.ndarray, sep: dict) -> dict:
     """The faces of a pictorial (isometric) view: each region its outline and edges enclose, in its own colour with
     an id (F1 = the largest). On a formed part they show which panels lie flat, which rise, and where they meet.
@@ -458,7 +495,8 @@ def faces(gray: np.ndarray, sep: dict) -> dict:
     grown = [cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) for m in masks]
     touching = {ids[a]: [ids[b] for b in range(len(keep)) if b != a and (grown[a] & grown[b]).sum() >= 20]
                 for a in range(len(keep))}
-    return {"faces": [{"id": i, "area_px": int(stats[lab, 4]), "touches": touching[i]} for i, lab in zip(ids, keep)],
+    return {"faces": [{"id": i, "area_px": int(stats[lab, 4]), "touches": touching[i],
+                       "shape": shape_descriptor(labels == lab)} for i, lab in zip(ids, keep)],
             "_image": label_image(gray, masks, ids)}
 
 

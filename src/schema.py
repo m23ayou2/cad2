@@ -518,7 +518,29 @@ class CornerCheck(Strict):
         return self
 
 
+class Objection(Strict):
+    claim: str = Field(description="What is wrong with the model, in one sentence")
+    evidence: str = Field(description="What the drawing shows against what the model shows, and in which view")
+    feature: str | None = Field(None, description="The feature id it concerns, if any")
+    kind: Literal["mirrored", "orientation", "missing_feature", "extra_feature", "wrong_face", "wrong_count",
+                  "bend_direction", "wrong_size", "wrong_profile", "other"]
+    severity: Literal["high", "low"] = Field(description="high: the part's shape is wrong; low: a detail")
+
+
+class RedTeamReport(Strict):
+    """The red team's answer: the strongest reasons the finished model is wrong."""
+    verdict: Literal["objections", "no_objection"]
+    objections: list[Objection] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def consistent(self) -> RedTeamReport:
+        if self.verdict == "objections" and not self.objections:
+            raise ValueError("verdict 'objections' needs at least one objection")
+        return self
+
+
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
-    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport, PathReport, CornerCheck,
+    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport, PathReport, CornerCheck, RedTeamReport,
 )}

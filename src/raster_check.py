@@ -17,6 +17,20 @@ position) and compared with the view's part edges as separated by raster_lines (
 - a view of kind "auto" (cropped from the sheet, not labelled) tries every standard direction, turned on the
   sheet, and every isometric camera, and is reported as the kind that fits best.
 
+How the fit is judged (the scene-matching method of GeoInt's terrain and pose tools, adapted):
+- the scale is fixed when it is known (measured on the view, or on another view of the sheet); only a view with no
+  measured scale searches it;
+- separability: the best camera's score is reported with the runner-up's and the gap between them, and the fit in
+  pixels; a gap within the noise means the view cannot tell the candidates apart (`separation.decided` false);
+- landmarks: hole centres found in the drawing are matched to the model's cylinders seen end-on (same diameter),
+  which places the drawing on the model more precisely than its edges; each match is checked by leaving it out
+  (a misread or misplaced hole stands out), and the landmark offset starts the final alignment;
+- model edges under annotations (dimension, extension and leader lines, text) are not counted as missing: they are
+  hidden on the drawing, not absent from it;
+- images for the validators are filled, not dotted: the drawing's regions in colour, the model's projection filled
+  into faces in the same pixel frame, their silhouettes overlaid (both / drawn only / model only), and, with
+  landmarks, a match sheet with a line per matched hole.
+
 Writes validation.json in validate.py's format (views with metrics, missing / extra regions, images, points), so
 the validation agents and the correction loop work unchanged.
 """
@@ -34,6 +48,8 @@ from scipy.spatial import cKDTree
 
 import pose_solver as ps
 import raster_lines as rl
+import regions as rg
+import step_checks
 import validate as vc
 from views import ViewDirection
 
@@ -47,26 +63,177 @@ def shaded(gray: np.ndarray) -> bool:
     return bool(ink.sum()) and float(((gray > 70) & (gray < 215))[ink].mean()) > 0.5
 
 
-def part_points(gray: np.ndarray, cache: str | None = None) -> np.ndarray:
-    """The view's part edges, as points in pixels with y up (annotations and centre lines removed). A shaded render
-    has no strokes to separate: its edges are where the shading changes sharply (Canny). The separation takes a
-    minute on a crowded view, so the mask is kept in `cache` (the scan's folder) for the next rounds."""
-    path = os.path.join(cache, "check_part.png") if cache else None
-    if path and os.path.isfile(path):
-        part = cv2.imread(path, cv2.IMREAD_GRAYSCALE) > 0
+def edges_and_annotations(gray: np.ndarray, cache: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """The view's part edges (annotations and centre lines removed) and its annotations (dimension, extension and
+    leader lines, arrowheads, text), as masks. A shaded render has no strokes to separate: its edges are where the
+    shading changes sharply (Canny) and it has no annotations. The separation takes up to a minute on a crowded
+    view, so both masks are kept in `cache` (the scan's folder) for the next rounds."""
+    part_path = os.path.join(cache, "check_part.png") if cache else None
+    annot_path = os.path.join(cache, "check_annot.png") if cache else None
+    if part_path and annot_path and os.path.isfile(part_path) and os.path.isfile(annot_path):
+        part = cv2.imread(part_path, cv2.IMREAD_GRAYSCALE) > 0
+        annot = cv2.imread(annot_path, cv2.IMREAD_GRAYSCALE) > 0
     elif shaded(gray):
         part = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 110) > 0
+        annot = np.zeros_like(part)
     else:
         sep = rl.separate_structure(gray)
         axes, _ = rl.dashed_runs(sep["part"])
         part = sep["part"] & ~axes
-    if path and not os.path.isfile(path) and part.shape == gray.shape:
-        cv2.imwrite(path, part.astype(np.uint8) * 255)
+        annot = sep["dimension"] | sep["extension"] | sep["text"]      # arrowheads are in the dimension layer
+    if part.shape != gray.shape:
+        return part, np.zeros_like(part)
+    if part_path:
+        cv2.imwrite(part_path, part.astype(np.uint8) * 255)
+        cv2.imwrite(annot_path, annot.astype(np.uint8) * 255)
+    return part, annot
+
+
+def part_points(part: np.ndarray) -> np.ndarray:
+    """Part edge pixels as points with y up."""
     ys, xs = np.nonzero(part)
     pts = np.stack([xs, -ys], 1).astype(float)
     if len(pts) > 20000:
         pts = pts[np.random.default_rng(0).choice(len(pts), 20000, replace=False)]
     return pts
+
+
+def to_pixels(points_mm: np.ndarray, offset: np.ndarray, scale: float) -> np.ndarray:
+    """View-plane mm (as aligned: drawing px * scale + offset) back to the drawing's pixels (x right, y down)."""
+    p = (points_mm - offset) / scale
+    return np.stack([p[:, 0], -p[:, 1]], 1)
+
+
+# --------------------------------------------------------------------------- landmarks
+def drawn_holes(part: np.ndarray) -> list[dict]:
+    """Circles on the drawing's part edges (holes, bores, bosses seen end-on), in pixels."""
+    import raster_vector
+    return raster_vector.find_holes(part)
+
+
+def model_holes(shape, spec: dict, rot: np.ndarray) -> list[dict]:
+    """The model's cylinders seen end-on from this camera (axis along the view direction): their centres in the
+    view plane (same frame as the projected edges, after the turn `rot`) and diameters."""
+    look = np.array(spec["look"], float)
+    look /= np.linalg.norm(look)
+    b = ps.view_basis(spec["look"], spec["up"])
+    out = []
+    for c in step_checks.cylinder_inventory(shape):
+        if abs(float(np.dot(c["axis"], look))) < 0.98:
+            continue
+        p = np.array(c["key"][2], float)
+        centre = rot @ np.array([p @ b[0], p @ b[1]])
+        out.append({"centre": centre, "d": 2 * c["radius"]})
+    return out
+
+
+def register_landmarks(drawn: list[dict], model: list[dict], scale: float, tol: float) -> dict | None:
+    """Match drawn hole centres to model hole centres of the same diameter by one offset (RANSAC over pairs), then
+    check each match by leaving it out: the offset from the other matches predicts where that hole should be, and a
+    hole far from its prediction is suspect (misread, misplaced, or a different hole). None if fewer than two match."""
+    if len(drawn) < 2 or len(model) < 2:
+        return None
+    dpts = [(np.array([h["centre"][0], -h["centre"][1]]) * scale, h["d_px"] * scale, h) for h in drawn]
+    same = lambda dd, md: abs(dd - md) <= max(0.15 * md, 1.0)
+    best = None
+    for dp, dd, _ in dpts:
+        for m in model:
+            if not same(dd, m["d"]):
+                continue
+            t = m["centre"] - dp
+            pairs, used = [], set()
+            for i, (dp2, dd2, _) in enumerate(dpts):
+                cands = [(float(np.linalg.norm(dp2 + t - m2["centre"])), j) for j, m2 in enumerate(model)
+                         if j not in used and same(dd2, m2["d"])]
+                if cands:
+                    dist, j = min(cands)
+                    if dist <= 3 * tol:
+                        pairs.append((i, j)); used.add(j)
+            if best is None or len(pairs) > len(best):
+                best = pairs
+    if not best or len(best) < 2:
+        return None
+    diffs = np.array([model[j]["centre"] - dpts[i][0] for i, j in best])
+    offset = np.median(diffs, axis=0)
+    matches = []
+    for k, (i, j) in enumerate(best):
+        others = np.delete(diffs, k, axis=0)
+        t_k = np.median(others, axis=0)
+        residual = float(np.linalg.norm(dpts[i][0] + t_k - model[j]["centre"]))
+        matches.append({"drawn_px": [round(v, 1) for v in dpts[i][2]["centre"]], "drawn_d_mm": round(dpts[i][1], 2),
+                        "model_mm": [round(float(v), 2) for v in model[j]["centre"]], "model_d_mm": round(model[j]["d"], 2),
+                        "residual_mm": round(residual, 2), "suspect": residual > 3 * tol})
+    rms = float(np.sqrt(np.mean([np.linalg.norm(dpts[i][0] + offset - model[j]["centre"]) ** 2 for i, j in best])))
+    return {"offset": offset, "matches": matches, "rms_mm": round(rms, 3),
+            "drawn_holes": len(drawn), "model_holes": len(model)}
+
+
+# --------------------------------------------------------------------------- filled images
+def raster_model(polylines: list, offset: np.ndarray, scale: float, shape: tuple) -> np.ndarray:
+    """The model's projection drawn straight from the STEP into the drawing's pixel frame: each visible edge (hidden
+    lines removed) as a continuous line, like a drawing view (white paper, black lines)."""
+    img = np.full(shape, 255, np.uint8)
+    for line in polylines:
+        if len(line) < 2:
+            continue
+        px = np.round(to_pixels(line, offset, scale) * 4).astype(np.int32)       # 2 bits of sub-pixel precision
+        cv2.polylines(img, [px], False, 0, 2, cv2.LINE_AA, shift=2)
+    return img
+
+
+def silhouette(regions_list: list[dict], shape: tuple) -> np.ndarray:
+    """The union of regions, with the strokes between them: the area the part covers in this view."""
+    m = np.zeros(shape, np.uint8)
+    for r in regions_list:
+        m |= r["mask"].astype(np.uint8)
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)) > 0
+
+
+def filled_comparison(gray: np.ndarray, annot: np.ndarray, model: list, offset: np.ndarray, scale: float,
+                      stem: str, landmarks: dict | None) -> tuple[dict, dict]:
+    """Filled images for the validators and the silhouette metrics. Returns (images, metrics)."""
+    drawn_regions = rg.fill_regions(gray)
+    rg.annotation_share(gray, drawn_regions, annot)
+    # paper boxed in by dimension lines is not part of the part; but on a view with hardly any annotations (an
+    # isometric) a long thin edge can pass for one, so there every region counts
+    ink = gray < rg.INK
+    dimensioned = annot[ink].mean() > 0.25 if ink.any() else False
+    part_regions = [r for r in drawn_regions if not dimensioned or r["annotation_share"] < 0.6]
+    model_ink = raster_model(model, offset, scale, gray.shape)
+    model_regions = rg.fill_regions(model_ink)
+    images = {"drawing": stem + ".drawing_filled.png", "model": stem + ".model_filled.png",
+              "overlay": stem + ".overlay_filled.png"}
+    cv2.imwrite(images["drawing"], rg.label_image(gray, drawn_regions))
+    cv2.imwrite(images["model"], rg.label_image(model_ink, model_regions))
+    ds, ms = silhouette(part_regions, gray.shape), silhouette(model_regions, gray.shape)
+    over = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR).astype(float)
+    over = 255 - (255 - over) * 0.5
+    for mask, colour in ((ds & ms, (120, 200, 120)), (ds & ~ms, (60, 160, 255)), (ms & ~ds, (220, 120, 200))):
+        over[mask] = over[mask] * 0.35 + np.array(colour) * 0.65
+    over = over.astype(np.uint8)
+    over[model_ink < 128] = (150, 0, 150)
+    rg._text(over, "green: both   orange: drawn, not in model   purple: in model, not drawn", (8, 22), 0.5)
+    cv2.imwrite(images["overlay"], over)
+    union = int((ds | ms).sum())
+    metrics = {"silhouette_iou": round(float((ds & ms).sum()) / union, 3) if union else None,
+               "drawn_only_share": round(float((ds & ~ms).sum()) / max(1, int(ds.sum())), 3),
+               "model_only_share": round(float((ms & ~ds).sum()) / max(1, int(ms.sum())), 3),
+               "drawn_faces": len(part_regions), "model_faces": len(model_regions)}
+    if landmarks and landmarks.get("matches"):
+        left = rg.label_image(gray, drawn_regions)
+        right = rg.label_image(model_ink, model_regions)
+        sheet = np.hstack([left, np.full((gray.shape[0], 20, 3), 255, np.uint8), right])
+        for k, m in enumerate(landmarks["matches"]):
+            colour = tuple(int(c) for c in rg.PALETTE[k % len(rg.PALETTE)][::-1]) if not m["suspect"] else (0, 0, 230)
+            a = tuple(int(v) for v in m["drawn_px"])
+            b = to_pixels(np.array([m["model_mm"]], float), offset, scale)[0]
+            b = (int(b[0]) + gray.shape[1] + 20, int(b[1]))
+            cv2.circle(sheet, a, 7, colour, 2)
+            cv2.circle(sheet, b, 7, colour, 2)
+            cv2.line(sheet, a, b, colour, 1, cv2.LINE_AA)
+        images["matches"] = stem + ".matches.png"
+        cv2.imwrite(images["matches"], sheet)
+    return images, metrics
 
 
 def sample(points: np.ndarray, n: int) -> np.ndarray:
@@ -121,7 +288,8 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
     if kind == "detail":
         return {"unresolved": "detail view: a magnified piece of the part, not comparable with the whole model's "
                               "projection; judge it by eye"}, None, None
-    drawn_px = part_points(gray, scan.get("folder"))
+    part, annot = edges_and_annotations(gray, scan.get("folder"))
+    drawn_px = part_points(part)
     if len(drawn_px) < 50:
         return {"unresolved": "too few part edges found in this scan"}, None, None
     candidates = []
@@ -155,7 +323,7 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
             f"no direction for this view (kind {kind!r}, direction {direction!r})"
         return {"unresolved": reason}, None, None
 
-    best, given = None, None
+    best, given, per_camera = None, None, {}
     turns = (0, 90, 180, 270) if kind in ORTHOGRAPHIC else (0,)
     for caption, spec in candidates:
         try:
@@ -165,9 +333,10 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
         if len(projected) == 0:
             continue
         px_per_mm = scan.get("px_per_mm") if kind in ORTHOGRAPHIC else None
-        hows = ["measured"] if px_per_mm else (["sheet"] if sheet_px_per_mm else []) + [
-            # leaders and centre lines beyond the outline only make the drawing look larger: try larger scales too
-            f"fitted*{f}" for f in (1.0, 1.1, 1.2, 1.35, 1.5)]
+        # a known scale is used as it is: searching it as well lets a wrong camera absorb its error through the scale
+        hows = (["measured"] if px_per_mm else ["sheet"] if sheet_px_per_mm else
+                # no scale at all: leaders and centre lines beyond the outline only make the drawing look larger
+                [f"fitted*{f}" for f in (1.0, 1.1, 1.2, 1.35, 1.5)])
         for turn, how in ((t, h) for t in spec.get("turns", turns) for h in hows):
             # the view drawn turned on the sheet by `turn` degrees anticlockwise
             a = math.radians(turn)
@@ -186,15 +355,60 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
             found = (score, offset, drawn, model, label, spec, measured_scale, scale, rot, tol)
             if best is None or score > best[0]:
                 best = found
+            per_camera[label] = max(per_camera.get(label, 0.0), score)
             if spec.get("given") and turn == 0 and (given is None or score > given[0]):
                 given = found
     if best is None:
         return {"unresolved": "the model projection is empty"}, None, None
     _, offset, drawn, model, caption, spec, measured_scale, scale, rot, tol = best
-    metrics, missing, extra, aligned = vc.compare(drawn, sample(model, 12000), tol=tol, start=offset)
+    # landmarks (holes seen end-on) place the drawing on the model more precisely than its edges
+    landmarks = None
+    if spec.get("class", kind) != "isometric" and measured_scale:     # positions mean nothing at a guessed scale
+        landmarks = register_landmarks(drawn_holes(part), model_holes(shape, spec, rot), scale, tol)
+        if landmarks:
+            # use their offset only when enough holes agree and it fits the edges at least as well as the edges' own
+            agree = len(landmarks["matches"]) >= 3 and landmarks["rms_mm"] <= 2 * tol
+            tree = cKDTree(sample(model, 4000))
+            cover = lambda t: float((tree.query(sample(drawn, 3000) + t)[0] <= tol).mean())
+            better = agree and cover(landmarks["offset"]) >= cover(offset) - 0.02
+            landmarks["used"] = bool(better)
+            landmarks["note"] = ("holes matched to the model's end-on cylinders; their common offset placed the "
+                                 "drawing" if better else "too few holes agree, or their offset fits the edges "
+                                 "worse: the drawing was placed by its edges")
+            if better:
+                offset = landmarks["offset"]
+    # model edges hidden under annotations on the drawing are not missing from it
+    px = to_pixels(model, offset, scale).round().astype(int)
+    inside = (px[:, 0] >= 0) & (px[:, 0] < annot.shape[1]) & (px[:, 1] >= 0) & (px[:, 1] < annot.shape[0])
+    hidden = np.zeros(len(model), bool)
+    near = cv2.dilate(annot.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    hidden[inside] = near[px[inside, 1], px[inside, 0]] & ~cv2.dilate(part.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)[px[inside, 1], px[inside, 0]]
+    visible = model[~hidden] if (~hidden).sum() > 50 else model
+    metrics, missing, extra, aligned = vc.compare(drawn, sample(visible, 12000), tol=tol, start=offset)
+    final_offset = (aligned[0] - drawn[0]) if len(drawn) else offset
+    ranked = sorted(per_camera.items(), key=lambda kv: -kv[1])
+    runner = next(((lab, sc) for lab, sc in ranked if lab != caption), None)
+    fit_px = metrics["mean_mm"] / scale
+    separation = {"best": caption, "best_score": round(ranked[0][1] / 2, 3) if ranked else None,
+                  "runner_up": runner[0] if runner else None, "runner_up_score": round(runner[1] / 2, 3) if runner else None,
+                  "gap": round((ranked[0][1] - runner[1]) / 2, 3) if runner else None,
+                  "fit_px": round(fit_px, 2)}
+    separation["decided"] = bool(runner is None or separation["gap"] >= 0.05)
+    separation["note"] = ("scores are the mean of the drawn and model coverage (0..1); the gap is how far the best "
+                          "camera is ahead of the next one. Not decided: this view cannot tell those cameras apart, so "
+                          "it says nothing about the orientation" if not separation["decided"] else
+                          "the best camera is clearly ahead of the others")
     b = ps.view_basis(spec["look"], spec["up"])
     basis = [rot[0, 0] * b[0] + rot[0, 1] * b[1], rot[1, 0] * b[0] + rot[1, 1] * b[1]]
-    entry = {"metrics": metrics, "missing_regions": missing, "extra_regions": extra,
+    stem = scan.get("_stem")
+    images, filled = {}, {}
+    if stem:   # the projection again, as lines this time, turned like the drawing
+        lines = [np.asarray(l) @ rot.T for l in ps.model_view_points(shape, spec, polylines=True)]
+        images, filled = filled_comparison(gray, annot, lines, final_offset, scale, stem, landmarks)
+    metrics = {**metrics, **filled, "hidden_by_annotations": round(float(hidden.mean()), 3)}
+    entry = {"metrics": metrics, "missing_regions": missing, "extra_regions": extra, "separation": separation,
+             **({"landmarks": {k: v for k, v in landmarks.items() if k != "offset"}} if landmarks else {}),
+             "_images": images,
              "horizontal": vc.axis_name(basis[0]), "vertical": vc.axis_name(basis[1]),
              "looking_along": vc.axis_name(np.array(spec["look"], float)),
              "camera": caption, "scale_mm_per_px": round(scale, 5),
@@ -238,18 +452,20 @@ def run(drawing: str, step: str, scans_json: str, out_dir: str) -> dict:
         stem = os.path.join(out_dir, s["id"])
         cv2.imwrite(stem + ".drawing.png", gray)
         try:
-            result, drawn, model = check_view(shape, s, gray, sheet_px_per_mm)
+            result, drawn, model = check_view(shape, {**s, "_stem": stem}, gray, sheet_px_per_mm)
         except Exception as error:
             entry["unresolved"] = f"projection failed: {error}"
             continue
+        filled = result.pop("_images", {})
         entry.update(result)
         if drawn is None:
             continue
-        entry["images"] = {"drawing": stem + ".drawing.png", "model": stem + ".model.png",
-                           "overlay": stem + ".overlay.png"}
-        vc.plot(stem + ".model.png", None, model, f"{entry['label']}: model, {entry['camera']}",
+        # the validators see the filled images (faces in colour, silhouettes overlaid); the edge plots stay on disk
+        entry["images"] = filled or {"drawing": stem + ".drawing.png", "model": stem + ".edges_model.png",
+                                     "overlay": stem + ".edges_overlay.png"}
+        vc.plot(stem + ".edges_model.png", None, model, f"{entry['label']}: model, {entry['camera']}",
                 entry["horizontal"], entry["vertical"])
-        vc.plot(stem + ".overlay.png", drawn, model, f"{entry['label']}: scanned edges (black) vs model (red); "
+        vc.plot(stem + ".edges_overlay.png", drawn, model, f"{entry['label']}: scanned edges (black) vs model (red); "
                 "orange = drawn, missing in model; purple = in model, not drawn",
                 entry["horizontal"], entry["vertical"], entry["missing_regions"], entry["extra_regions"])
         np.savez_compressed(stem + ".points.npz", drawing=drawn, model=model)

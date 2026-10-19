@@ -65,6 +65,9 @@ def summary(results: list[dict], views: list[dict], run, seconds: float) -> str:
         lines += [f"## {v['id']}", "", f"![{v['id']}](views/{v['id']}_regions.png)", "",
                   "| region | role | shape | dimensions | create | conf. |", "|---|---|---|---|---|---|"]
         for r in rows:
+            if r.get("skipped"):
+                lines.append(f"| {r['region']} | background (skipped) | | annotation share {r['annotation_share']} | | |")
+                continue
             if "error" in r:
                 lines.append(f"| {r['region']} | error | | {r['error'][:80]} | | |")
                 continue
@@ -97,10 +100,26 @@ def analyse_sheet(m, run, out_dir: Path, max_regions: int = 15, min_share: float
     cv2.imwrite(str(out_dir / "views" / "sheet_views.png"), overview)
     agent = m.load_agent("path")
     jobs = []
+    import raster_lines
+    skipped = []
     for v in views:
         regions = rg.fill_regions(v["image"])
+        # paper boxed in by dimension lines is background: no need to ask the agent (only on a dimensioned view,
+        # where annotations make a good share of the ink; on an isometric a long edge can pass for one)
+        sep = raster_lines.separate_structure(v["image"])
+        annot = sep["dimension"] | sep["extension"] | sep["text"]
+        ink = v["image"] < rg.INK
+        import raster_vector
+        dimensioned = len(raster_vector.dimensions(sep, sep["text"])[0]) >= 2      # it carries real dimensions
+        rg.annotation_share(v["image"], regions, annot)
+        background = [r for r in regions if dimensioned and r["annotation_share"] >= 0.6]
+        for r in background:
+            skipped.append({"view": v["id"], "region": r["id"], "role": "background", "skipped": True,
+                            "annotation_share": r["annotation_share"],
+                            "description": "bounded mostly by dimension, extension or leader lines: not analysed"})
         largest = regions[0]["area_px"] if regions else 0
-        picked = [r for r in regions if r["area_px"] >= min_share * largest][:max_regions]
+        bg = {r["id"] for r in background}
+        picked = [r for r in regions if r["area_px"] >= min_share * largest and r["id"] not in bg][:max_regions]
         labelled = rg.label_image(v["image"], regions)
         cv2.imwrite(str(out_dir / "views" / f"{v['id']}.png"), v["image"])
         cv2.imwrite(str(out_dir / "views" / f"{v['id']}_regions.png"), labelled)
@@ -115,7 +134,8 @@ def analyse_sheet(m, run, out_dir: Path, max_regions: int = 15, min_share: float
         return analyse(m, run, agent, sheet_png, item[0], item[1], item[2], item[3], out_dir / "regions")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(job, jobs))
+        results = list(pool.map(job, jobs)) + skipped
+    log.info("paths: %d region(s) analysed, %d skipped as background", len(jobs), len(skipped))
     seconds = time.monotonic() - started
     (out_dir / "paths.json").write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
     (out_dir / "summary.md").write_text(summary(results, views, run, seconds), encoding="utf-8")

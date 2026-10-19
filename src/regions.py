@@ -129,6 +129,17 @@ def fill_regions(gray: np.ndarray, min_area: int = 300) -> list[dict]:
     return regions
 
 
+def annotation_share(gray: np.ndarray, regions: list[dict], annotations: np.ndarray) -> None:
+    """For each region, the share of the ink round its border that is annotation (dimension, extension and leader
+    lines, arrowheads, text), as separated by raster_lines: a strip of paper boxed in by dimension lines is bounded
+    almost only by annotations, a face of the part by its own edges. Sets r["annotation_share"] (0..1)."""
+    ink = gray < INK
+    for r in regions:
+        m = r["mask"].astype(np.uint8)
+        ring = (cv2.dilate(m, np.ones((5, 5), np.uint8)) > 0) & ~r["mask"] & ink
+        r["annotation_share"] = round(float(annotations[ring].mean()), 3) if ring.any() else 0.0
+
+
 def deepest_point(mask: np.ndarray) -> list[float]:
     d = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
     y, x = np.unravel_index(int(np.argmax(d)), d.shape)
