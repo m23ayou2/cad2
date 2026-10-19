@@ -58,6 +58,11 @@ from pydantic import BaseModel, ValidationError  # noqa: E402
 
 MODEL = "openai/gpt-6-luna" 
 MODEL = "anthropic/claude-haiku-5.5"   # skipped for now, for both images and reasoning
+# Two roles: agents marked `role: vision` in their YAML (looking at images: view analyses, path agent, corner
+# check, the validators' looking step) run on VISION_MODEL; the rest (planner, builder, arbiter, validators'
+# judging step, red team) on MODEL, the reasoning model. Set both to the same id to use one model.
+VISION_MODEL = "qwen/qwen3-vl-30b-a3b-instruct"
+SPLIT_VALIDATION = True   # validation in two steps: the vision model describes, the reasoning model judges
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -75,6 +80,14 @@ class Agent:
     name: str
     settings: dict
     prompt: str
+
+    @property
+    def role(self) -> str:
+        return "vision" if self.settings.get("role") == "vision" else "reasoning"
+
+    @property
+    def model(self) -> str:
+        return VISION_MODEL if self.role == "vision" else MODEL
 
     @property
     def tools(self) -> list[str]:
@@ -105,8 +118,6 @@ def load_agent(name: str) -> Agent:
     if not match:
         raise ValueError(f"agents/{name}.md has no YAML front matter")
     settings = yaml.safe_load(match.group(1)) or {}
-    if settings.get("model", MODEL) != MODEL:
-        log.warning("agents/%s.md asks for %s; using %s", name, settings["model"], MODEL)
     return Agent(name, settings, match.group(2).strip())
 
 
@@ -1067,8 +1078,8 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
     messages: list[dict] = [{"role": "system", "content": agent.system_prompt}, {"role": "user", "content": content}]
     max_turns = int(agent.settings.get("max_turns", 10))
     started, agent_cost = time.monotonic(), 0.0
-    alog.info("started (%d tools, max %d turns)", len(tools), max_turns)
-    run.trace("agent_start", agent=label, tools=agent.tools)
+    alog.info("started on %s (%s, %d tools, max %d turns)", agent.model, agent.role, len(tools), max_turns)
+    run.trace("agent_start", agent=label, tools=agent.tools, model=agent.model, role=agent.role)
 
     used: set[str] = set()
     stopped = False
@@ -1082,7 +1093,7 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
             kwargs["temperature"] = agent.settings["temperature"]
         t0 = time.monotonic()
         extra = {"usage": {"include": True}} | reasoning_setting(agent)
-        reply = run.client.chat.completions.create(model=MODEL, messages=messages, extra_body=extra, **kwargs)
+        reply = run.client.chat.completions.create(model=agent.model, messages=messages, extra_body=extra, **kwargs)
         choice = reply.choices[0]
         if not (choice.message.content or choice.message.tool_calls) and choice.finish_reason == "length":
             # a reasoning model can spend the whole budget thinking and say nothing: ask again without reasoning
@@ -1091,7 +1102,7 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
             run.trace("empty_reasoning_reply", agent=label, turn=turn, usage=reply.usage.model_dump() if reply.usage else {})
             if reply.usage and (reply.usage.model_dump().get("cost") is not None):
                 run.cost_usd += reply.usage.model_dump()["cost"]
-            reply = run.client.chat.completions.create(model=MODEL, messages=messages, **kwargs, extra_body={
+            reply = run.client.chat.completions.create(model=agent.model, messages=messages, **kwargs, extra_body={
                 "usage": {"include": True}, "reasoning": {"enabled": False}})
         usage = reply.usage.model_dump() if reply.usage else {}
         cost = usage.get("cost")
@@ -1550,6 +1561,24 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
             text + "\n\n## Images shown\n" + "\n".join(f"- {caption} `{Path(entry['images'][key]).name}`"
                                                        for key, caption in captions if key in entry["images"]),
             encoding="utf-8")
+        if SPLIT_VALIDATION:
+            # step 1, the vision model: what differs between the images (no tree, no judgement)
+            look = [{"type": "text", "text": f"View: {view.id} (label on the sheet: {view.label}), a {kind} view. "
+                                             f"{frame}"}] + content[1:]
+            try:
+                seen = run_agent(load_agent("validation/look"), Ctx(run, view, entry), look,
+                                 label=f"validation/look[{view.id}]")
+                (out_dir / f"{view.id}.look.json").write_text(json.dumps(seen, indent=2, ensure_ascii=False),
+                                                             encoding="utf-8")
+                vlog.info("%s: the vision model sees %d difference(s), %d match(es)", view.id,
+                          len(seen["differences"]), len(seen["matches"]))
+                # step 2, the reasoning model: the numbers, the tree and what was seen; no images
+                content = [{"type": "text", "text": text + "\n\n## What the vision inspector sees\nAnother model "
+                            "looked at the drawing view, the model from the same camera and their overlay (you do "
+                            "not get the images). It describes; you judge, using the numbers above and the tree:\n"
+                            "```json\n" + json.dumps(seen, indent=1, ensure_ascii=False) + "\n```"}]
+            except Exception as error:
+                vlog.warning("%s: vision look failed (%s); validating with the images in one step", view.id, error)
         try:
             report = run_agent(load_agent(f"validation/{kind}"), Ctx(run, view, entry), content,
                                label=f"validation/{kind}[{view.id}]")
@@ -1701,8 +1730,9 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
         run_dir = RUNS_DIR / f"{drawing.parent.parent.name}-{drawing.parent.name}-{stamp}"
         run_dir.mkdir(parents=True)
         run = open_run(drawing, run_dir, max_cost)
-        run.trace("run_start", drawing=str(drawing), model=MODEL)
-    log.info("run %s: %s with %s", run.dir.name, drawing, MODEL)
+        run.trace("run_start", drawing=str(drawing), model=MODEL, vision_model=VISION_MODEL,
+                  split_validation=SPLIT_VALIDATION)
+    log.info("run %s: %s with %s (reasoning) and %s (vision)", run.dir.name, drawing, MODEL, VISION_MODEL)
     if paths and not rebuild:  # the region-by-region analysis (paths.py), saved in this run's paths/ folder
         import paths as path_analysis
         try:
@@ -1776,7 +1806,8 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
     final = min(rounds, key=round_rank) if rounds else None
     out = run.dir / "result.json"
     out.write_text(json.dumps({
-        "drawing": str(drawing), "model": MODEL, "status": final["build"] if final else report["status"],
+        "drawing": str(drawing), "model": MODEL, "vision_model": VISION_MODEL, "split_validation": SPLIT_VALIDATION,
+        "status": final["build"] if final else report["status"],
         "validated": bool(final and final["measured_views"]),  # judged by eye only does not count
         "measured_views": final["measured_views"] if final else 0,
         "drawn_covered": final["drawn_covered"] if final else None,

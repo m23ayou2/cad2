@@ -2,7 +2,6 @@
 name: builder
 reasoning: low   # off | low | medium | high (main.py reasoning_setting)
 description: Turns a feature tree into a CadQuery script and a STEP file, running and fixing it until it is one valid solid.
-model: openai/gpt-6-luna
 temperature: 0.1
 max_turns: 12
 tools:

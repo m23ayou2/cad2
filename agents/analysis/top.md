@@ -2,7 +2,7 @@
 name: top
 reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses the top (plan) view of a drawing, which gives the footprint and hole patterns.
-model: openai/gpt-6-luna
+role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0.1
 max_turns: 6
 tools:

@@ -2,7 +2,7 @@
 name: path
 reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses one region (path) of one view of a drawing - what it is, its dimensions, and how to create it.
-model: openai/gpt-6-luna
+role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0.1
 max_turns: 2
 tools: []

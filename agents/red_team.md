@@ -2,7 +2,6 @@
 name: red_team
 reasoning: medium   # off | low | medium | high (main.py reasoning_setting)
 description: Argues that the finished model is wrong - the strongest reasons, from the drawing itself.
-model: openai/gpt-6-luna
 temperature: 0.2
 max_turns: 2
 tools: []
