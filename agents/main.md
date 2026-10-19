@@ -10,7 +10,12 @@ tools:
   - read_drawing_text # vector text with positions from the PDF (empty for scans)
   - split_views       # runs src/split.py: finds the views on the sheet and saves each one
   - call_subagent     # runs the subagent for one view and returns its JSON
+  - scan_view         # scanned sheets: dimensions, leaders, holes and outline of one view, by image processing
+  - set_dimension_values  # scanned sheets: fit the scale to the values you read and check every dimension
+  - trace_outline     # scanned flat blanks: the traced outline as exact lines and arcs, from your labels
 subagents: [analysis/front, analysis/top, analysis/side, analysis/section, analysis/detail, analysis/isometric]
+required_tools: [split_views, call_subagent]            # no final answer before the views are analysed
+required_tools_scanned: [scan_view, set_dimension_values]  # and, on a scan, before its dimensions are read
 output_schema: PartPlan   # pydantic model in src/schema.py
 ---
 
@@ -32,6 +37,29 @@ Call `view_drawing` to look at the full sheet, and `read_drawing_text` to get it
 Call `split_views`. It finds every view on the sheet and returns, for each one, an id, its type (front, top, side, section, detail, isometric), its label as written on the sheet, and its saved image.
 
 Check the result against the full sheet: every view you saw in step 1 should be there. Each view also comes with its `axes` in the part frame (image right, image up, viewing direction), worked out from the labels, the sheet layout and the cut-line arrows. **Use these signs; do not re-derive them.** Which end of the part a feature sits on follows from them: in a view whose image right is −Y, a leg drawn on the left is at +Y. Pass each view's axes to its subagent in `context` only if they are missing. If a view is missing or has the wrong type, say so in `uncertainties`.
+
+**Scanned sheets.** When `split_views` cannot split the sheet (a scan, no text layer), read each view with image processing before analysing it:
+1. `scan_view` with a box (fractions of the sheet) around the whole view **and all its dimensions** (dimension stacks can sit well outside the outline), its `kind` (front, top, side, section, detail, isometric, or flat_pattern for the unfolded blank of a sheet-metal part) and its `direction` (FRONT, TOP, LEFT, ... for orthographic views and sections; none otherwise). Each scan becomes a view with its own id (S1, S2, ...). It finds every dimension as two facing arrowheads (D1, D2, ...) with its length in pixels, every leader with where its arrow points (L1, L2, ...), and shows each dimension's value text enlarged.
+2. Read every value from the crops, exactly as printed, and call `set_dimension_values`. It fits one scale and checks each dimension. A scan with fewer than two dimensions (a copy of the blank carrying only callouts, an isometric) takes its scale from another scan at the same drawing scale: `set_dimension_values(scan=<it>, scale_from=<the dimensioned scan>)`, after that scan's values are set. Check `scale_from.check`: if it is not ok, the two are not at the same scale and that scan's mm cannot be used. Only the dimensions marked suspect need another look: re-read those (or leave them out) and **keep the values that already checked out**; never reshuffle values between dimensions that passed.
+3. Analyse each scanned view with `call_subagent(view_id=<its scan id>)`, and give the subagent its checked dimensions (value, direction, where it lies) and its leaders in `context`. Use the checked values, not your reading of the sheet, for every size.
+4. **The blank of a sheet-metal part comes from its copy without dimensions.** Sheets often draw the blank twice: once with ordinate dimensions, once with only the callouts (`BEND UP R1`, `BEND DOWN`, `Ø7 THRU`, radii). Scan both as `flat_pattern`. On the copy without dimensions `scan_view` traces the blank: its panels, and its **bend lines** (`B1`, `B2`, ...: the straight lines drawn across the blank between two panels), and marks each leader whose arrow points at a bend line with `bend`. Set its scale with `scale_from` (step 2); the result's `blank_mm` gives, in one frame (origin at the blank's lower-left corner, x right, y up, as drawn):
+   - `profile`: the raw traced outline as points. **Do not use it as it is**: turn it into exact geometry with `trace_outline` (next).
+   - `bend_lines`: each bend's `line`, from and to, exactly. **Never place a bend at an ordinate dimension**: ordinates locate edges, holes and bend-zone tangents, not the bend line.
+   - `holes`: centres in the same frame (diameters from the callouts, not from the tracing). **Every hole found is a `hole` in the tree**, placed at its flat position: two holes of the same diameter are two placements, never one. Count them against the callouts (`2X`, and each `Ø` leader) before writing the tree.
+   - the leaders in `leaders_mm`: a leader with `bend: "B2"` is that bend's callout; its text gives `direction` (UP / DOWN) and the radius when it names one (`R1`), else the notes' radius.
+   **Then call `trace_outline`** on that scan. `scan_view` showed the outline with its corners numbered V1, V2, ... in order round it. Go round the outline and say what each stretch between two corners is, using the drawing's callouts: `{"from": "V5", "to": "V7", "kind": "arc", "radius": 25}` for an arc labelled R25 (leave `radius` out when no callout gives it), `{"from": "V7", "to": "V8", "kind": "line"}` for a straight edge, and `"corner_radius": 2` on a line when a small labelled corner (R2) between it and the next line has no corners of its own. A stretch can run over several corners (an arc traced as V9, V10, V11, V12 is one span V9 to V12); the corners were already checked one by one from close-ups, and those where the trace followed an arrow or a leader were removed (`corners_dropped` in the scan result), so every corner shown is on the part; still span over a corner that is only a point along an edge. Its report gives each stretch's fit: a stretch marked not ok is labelled wrongly (often two arcs meeting, or an arc and a line): split it at the corner where the curve changes and call again, until all are ok. Its `profile` is the `base_flange` profile; quote the callouts used as evidence.
+   **Read the blank's overall width and height** on the dimensioned copy when they are dimensioned (the largest values, e.g. `70`): `scale_from` fits the copy without dimensions to them, since the two copies are often drawn at slightly different scales.
+   One `bend` per bend line, no more, no fewer. Every `bend` must have its `line`; if a bend line was not found, place it through the leader's tip across the strip joining the two panels it separates, and say so in `uncertainties`.
+5. **Work out the folding from the panels and the isometric faces before writing the tree.** `scan_view` shows the blank's **panels** in colour (P1, P2, ...; `bend_lines_join` says which two panels each bend line joins) and each isometric's **faces** in colour (F1, F2, ...; `touches` lists the faces each meets). Match them:
+   - For each panel, find its face in the isometric by its shape and its holes (a tab with one hole, the web with the S-curve, ...). Write the matches in `uncertainties` when one is not obvious.
+   - **The panel that stays flat** is the one whose face lies flat (the base the part rests on). Put its `inside` point (from `blank_mm.panels`) as `fixed` in the `base_flange` params.
+   - **Each bend's direction**: across bend line B joining panels Pa and Pb, does Pb's face rise above Pa's or drop below it in the isometric? `BEND UP` / `BEND DOWN` callouts are seen from the side the blank is drawn from; when the faces show a panel going the other way relative to the panel you keep flat, check which panel you chose as fixed before contradicting the callout.
+   - The folded part must have the isometric's shape: one fold per bend line, each face where the isometric shows it.
+
+The built model is compared with every scanned view (except flat patterns) by projecting it from the view's direction, so the kind and direction you give `scan_view` matter:
+- **Scan every view on the sheet, the isometric views included.** On a bent or sheet-metal part the isometric views are the only ones that show the formed shape; without them the bends cannot be checked.
+- **A view of the unfolded blank is a `flat_pattern`**, whether it carries bend callouts or ordinate dimensions: one flat outline, holes, no thickness shown, the same outline as another flat view. Never scan it as a top or front view of the formed part.
+- **A view of the formed part is never a `flat_pattern`**, even when it looks flat. Signs of a formed view: a flange or tab seen **edge-on** (a narrow strip, as wide as the sheet is thick, sticking out of the outline), a formed recess or pocket with rounded inner corners, a wall drawn as a line across the plate (its bend seen from above), pairs of dimensions differing by the sheet thickness (inner and outer faces). If no view on the sheet passes as a blank (no `BEND UP` / `BEND DOWN` callouts, no view that is only an outline with holes), **there is no flat pattern**: scan each view as the orthographic view it is (top, front, side) and model the formed part from them (below).
 
 ## 3. Analyse each view
 
@@ -61,20 +89,52 @@ Write **one feature tree for the whole part**, in the order a CAD modeller would
 
 | Cue on the drawing | op |
 |---|---|
+| **Core shape** | |
+| A closed outline that several features share (a profile used twice) | `sketch` |
 | Plate or block outline with a thickness | `extrude_boss` |
 | Concentric circles in one view, stepped profile in a section | `revolve_boss` (profile as `[[r, z], ...]` points) |
 | Pocket, notch, flat, through-cut | `extrude_cut` |
 | Groove, undercut, relief around an axis | `revolve_cut` |
-| `Ø… THRU`, `Ø… x 10 DEEP` | `hole` |
+| Separate bodies joined, subtracted or intersected | `boolean` (`operation`: union, subtract or intersect; `targets`) |
+| Bent tube, curved rail: a section moved along a path | `sweep` (`profile`, `path`) |
+| A transition between different sections | `loft` (`profile`, and the other sections in `sections`) |
+| `WALL 2`, thin-walled housing | `shell` |
+| Thin stiffening wall in a casting or housing | `rib` |
+| Draft angle note, cast or moulded faces | `draft` |
+| Thin sheet-like shape given a thickness | `thicken` |
+| **Holes and edges** | |
+| `Ø… THRU`, `2x Ø…`, `Ø… x 10 DEEP` | `hole` |
 | `CBORE`, `C'BORE`, ⌴ | `counterbore_hole` |
 | `CSK`, ⌵ | `countersink_hole` |
 | `M6`, `M8 x 1.25` on a hole | `tapped_hole` |
-| `M12` on a shaft | `external_thread` |
+| `M12 x 1.75` on a shaft | `external_thread` |
 | Obround or rectangular elongated cut | `slot` |
-| Key slot in a shaft or bore | `keyway` |
-| `1 x 45°`, `C1` | `chamfer` |
+| Key slot in a shaft or bore (width x depth) | `keyway` |
+| `0.5 x 45°`, `C1` | `chamfer` |
 | `R…` on an edge, `ALL FILLETS R2` | `fillet` |
-| `WALL 2`, thin-walled housing | `shell` |
+| `KNURL` note | `knurl` |
+| Gear or spline data table, `SPLINE`, module and tooth count | `gear_teeth` |
+| **Repeating and symmetry** | |
+| `4x` along a line, `EQ SP`, a spacing dimension | `linear_pattern` (`count`, `spacing`, `targets`), or `pattern` on the feature itself |
+| `6x` on a bolt circle, `PCD` | `circular_pattern` (`count`, `targets`), or `pattern` on the feature itself |
+| `SYMMETRIC ABOUT…`, a half drawn with a centreline | `mirror` (`plane`, `targets`) |
+| **Helpers** | |
+| Datum A, B, C that other features are placed from | `reference_plane` / `reference_axis` / `reference_point` |
+| `MARK`, `ENGRAVE` note | `engraving` (`text`, `depth`) |
+| **Sheet metal** | |
+| `MATERIAL THICKNESS 2`, `SHEET THICKNESS 3`: the part starts as a flat blank | `base_flange` (`profile` = the flat blank outline, `thickness`) |
+| A bent wall added along an edge | `edge_flange` (`length`, `angle`, `radius`, `targets`) |
+| `BEND UP 90° R2`, `BEND DOWN`, bend lines on a flat pattern | `bend` (`line` on the flat blank, `angle`, `direction` up or down, `radius`, `targets`) |
+| Louver, punched or formed shape in the sheet | `punch` |
+| A separate unfolded view of the blank | `flat_pattern` (documents the blank; the part is built by `base_flange` + `bend`) |
+| **Weldments, assemblies and surfaces** | |
+| `RHS 40x40x3`, beam or tube profile along a path | `structural_member` (`section`, `path`) |
+| Weld symbol | `weld_bead` (`size`, `targets`) |
+| Balloons and a bill of materials (assembly drawing) | `assembly_mate` |
+| Free-form curved body with no simple dimensions | `surface_model` |
+| Dome, wrap or flex callout | `deform` |
+
+Operations that act on earlier features (`boolean`, the patterns, `mirror`, `bend`, `edge_flange`, `weld_bead`) list them in `targets`. **Sheet metal:** when the sheet has a flat pattern (an unfolded blank, usually with `BEND UP` / `BEND DOWN` callouts or bend lines), model the part as a `base_flange` (the flat blank outline from the flat pattern, `thickness`, plus `radius` and `k_factor` from the notes) followed by one `bend` per bend line, in folding order outward from the panel that stays flat. A bend line drawn on a flat pattern is the **middle of the bend zone**: the zone, `radians(angle) * (radius + k_factor * thickness)` long, is centred on it. Add `fixed`, a point `[x, y]` inside the panel that stays flat, to the `base_flange` params. **A sheet-metal part drawn only formed** (no flat pattern) is not built from `base_flange` + `bend`, since there is no blank to fold: model it from its views as plates, `extrude_boss` of the base plate's outline from the top view, and each bent wall as the side view's sheet profile (the drawn line, thickness wide, with its bend radii) extruded across the width; recesses as `extrude_cut` + the formed floor. **The sheet thickness** comes from the notes (`SHEET THICKNESS 3`, `t=2`, `GAUGE`) or from a tab or wall seen edge-on, measured; never from a dimension that happens to be small. On a `base_flange` part, holes are `hole` features at their **flat** positions on the blank `[x, y, 0]` (the builder cuts them before folding, so they move with their panel); on a part drawn formed, at their 3D positions.
 
 - `params`: the values, in mm and degrees, named as in the schema: `d`, `depth` or `thru`, `cbore_d`, `cbore_depth`, `csk_d`, `csk_angle`, `thread`, `width`, `length`, `height`, `r`, `size`, `profile`.
 - `on`, `position` `[x, y, z]`, `direction`: where the feature starts and which way it goes, in the part frame. **Every feature needs a position**, given as numbers, never only in the text of `on`.
@@ -99,7 +159,7 @@ Frame: Z is up, the face the part rests on is at Z = 0, and the part is centred 
 
 **Round outlines are circles.** A feature dimensioned with `Ø` (a barrel, flange, boss, bore) has a circular profile: give `d` and `profile: "circle"`, never a list of polygon points approximating it.
 
-**Every number needs a source.** A value with no evidence must be covered by an assumption (`A1`, `A2`, ... with `covers: ["F03.depth"]`); the harness rejects a tree with an uncovered number. A feature that no operation can express (gear teeth, sheet-metal bends, engraving) goes in `unsupported`, not in the tree.
+**Every number needs a source.** A value with no evidence must be covered by an assumption (`A1`, `A2`, ... with `covers: ["F03.depth"]`); the harness rejects a tree with an uncovered number. A feature that no operation can express (gear teeth, engraving) goes in `unsupported`, not in the tree. **Unsupported is only for that.** A notch, step, slot, recess or any cut into an outline, however irregular, is an `extrude_cut` with its profile as points (on a turned part, cut from the rim with `direction` along the axis, or across it); a bend is a `bend`; a raised or recessed ring is a `revolve_boss` / `revolve_cut`. If you can draw its outline in one view and say how deep it goes, it goes in the tree, with assumptions for what the drawing does not give.
 
 # Revisions
 

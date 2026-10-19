@@ -25,6 +25,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -49,11 +50,14 @@ import conflicts  # noqa: E402
 import schema  # noqa: E402
 import split as splitter  # noqa: E402
 import views as view_reader  # noqa: E402
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
 import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
-MODEL = "openai/gpt-6-luna"
+MODEL = "openai/gpt-6-luna" 
+# MODEL = "anthropic/claude-haiku-5.5" 
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -117,6 +121,7 @@ class View:
     summary: dict = field(default_factory=dict)
     frame: dict | None = None  # axes of the view in the part frame, from validate.view_frames
     sheet_box: list[float] | None = None  # where the view is on the sheet: x0, y0, x1, y1 as page fractions
+    scan: dict | None = None  # scanned sheets: this view's scan (kind, direction, box), from scan_view
     outline_pt: list[float] | None = None  # the part outline alone (no dimensions), sheet points
 
 
@@ -132,6 +137,8 @@ class Run:
     summaries: list[dict] = field(default_factory=list)
     build_attempts: int = 0
     cross_check: dict | None = None  # conflicts between the view analyses and the arbiter's rulings
+    scans: dict = field(default_factory=dict)  # scanned sheets: regions read by scan_view, by id (S1, S2, ...)
+    scanned: bool = False  # split_views found no vector content: the sheet is a scan
 
     def __post_init__(self):
         self.build_attempts = len(list((self.dir / "build").glob("attempt_*.py")))  # continue on --build
@@ -245,13 +252,19 @@ def split_views(ctx: Ctx) -> ToolOutput:
         png = out_dir / "sheet.png"
         with pymupdf.open(run.drawing) as doc:
             png.write_bytes(png_of(doc[0]))
-        run.views = {"sheet": View("sheet", "WHOLE SHEET", None, png, None)}
+        # keep any views already scanned with scan_view: split_views may be called after them
+        run.views = {"sheet": View("sheet", "WHOLE SHEET", None, png, None)} | \
+            {k: v for k, v in run.views.items() if v.scan}
+        run.scanned = True
         run.trace("split", ok=False, error=str(error))
         return ToolOutput({
             "views": [{"id": "sheet", "label": "WHOLE SHEET", "suggested_subagent": None}],
-            "note": ("The sheet could not be split automatically (probably a scan). Call call_subagent once per "
-                     "view you saw, always with view_id 'sheet', and say in `context` which view to analyse "
-                     "and where it is on the sheet."),
+            "note": ("The sheet could not be split automatically (probably a scan). For each view you saw, call "
+                     "scan_view with a box around it and its dimensions, its kind and its direction. Each scan "
+                     "becomes a view with its own id (S1, S2, ...). Read the dimension values from the crops it "
+                     "returns and call set_dimension_values. Then call call_subagent once per scanned view, with "
+                     "view_id = its scan id, and put in `context` the checked dimensions (values, directions, "
+                     "scale) and the leaders from its scan."),
         })
 
     listing, meta = index_views(run)
@@ -412,6 +425,10 @@ def read_view_text(ctx: Ctx) -> dict:
 def zoom_view(ctx: Ctx, x0: Fraction, y0: Fraction, x1: Fraction, y1: Fraction) -> ToolOutput:
     """Zoom into a region of this view to read small text or details."""
     view = ctx.view
+    if view.pdf is None and view.sheet_box:  # a scanned view: zoom within its box on the sheet
+        b = view.sheet_box
+        x0, x1 = b[0] + x0 * (b[2] - b[0]), b[0] + x1 * (b[2] - b[0])
+        y0, y1 = b[1] + y0 * (b[3] - b[1]), b[1] + y1 * (b[3] - b[1])
     with pymupdf.open(view.pdf or ctx.run.drawing) as doc:
         image = png_of(doc[0], region(doc[0], x0, y0, x1, y1))
     caption = f"View {view.id}, region x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f}"
@@ -504,6 +521,393 @@ def extend_view(ctx: Ctx, view_id: Annotated[str, "A view id from the views list
                        "aligned_views": aligned}, images)
 
 
+SheetFraction = Annotated[float, "Fraction of the whole sheet, 0 to 1 from its top-left corner"]
+
+
+ScanKind = Literal["front", "top", "side", "section", "detail", "isometric", "flat_pattern"]
+ScanDirection = Literal["FRONT", "REAR", "TOP", "BOTTOM", "LEFT", "RIGHT", "none"]
+
+
+def scan_view(ctx: Ctx, x0: SheetFraction, y0: SheetFraction, x1: SheetFraction, y1: SheetFraction,
+              kind: Annotated[ScanKind, "What this view is; flat_pattern = the unfolded blank of a sheet-metal part"],
+              direction: Annotated[ScanDirection, "The standard direction it is seen from (orthographic views and "
+                                                  "sections); none for isometric, detail and flat_pattern"] = "none",
+              label: Annotated[str, "The view's label as written on the sheet, if any"] = "") -> ToolOutput:
+    """Scanned sheets only: read one view's geometry with image processing. Give a box around the view and its
+    dimensions, what kind of view it is and the direction it is seen from. Returns every dimension found (two facing
+    arrowheads: id, end points, length in pixels, direction), the leaders with where their arrows point, holes and
+    the part outline, an overlay with the ids, and enlarged crops of each dimension's value text to read. The scan
+    becomes a view of its own (its id): analyse it with call_subagent, and the built model is compared with it.
+    Then call set_dimension_values with the values you read."""
+    import raster_lines
+    import raster_vector
+
+    run = ctx.run
+    box = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+    if box[2] - box[0] < 0.03 or box[3] - box[1] < 0.03:
+        raise ValueError("Box too small: give fractions of the sheet around one whole view and its dimensions")
+    gray = raster_lines.render(str(run.drawing), box)
+    with pymupdf.open(run.drawing) as doc:
+        page = doc[0]
+        zoom = raster_lines.SHEET_PX / max(page.rect.width, page.rect.height)
+        sheet_w, sheet_h = page.rect.width * zoom, page.rect.height * zoom
+    result = raster_vector.vectorise(gray, flat=kind == "flat_pattern", pictorial=kind == "isometric")
+    scan_id = f"S{len(run.scans) + 1}"
+    folder = run.dir / "scans" / scan_id
+    raster_vector.save(result, gray, str(folder))
+    frac = lambda p: [round(box[0] + p[0] / sheet_w, 4), round(box[1] + p[1] / sheet_h, 4)]
+    dims = []
+    for n, d in enumerate(result["dimensions"], 1):
+        dims.append({"id": f"D{n}", "length_px": d["length_px"], "orientation": d["orientation"],
+                     "from_px": d["from"], "to_px": d["to"], "from_sheet": frac(d["from"]), "to_sheet": frac(d["to"]),
+                     "text_box_px": d["text_box"]})
+    shape = result["shape"]
+    leaders = [{"id": f"L{n}", "tip_px": l["at"], "tip_sheet": frac(l["at"]), "direction": l["direction"]}
+               | ({"bend": l["bend"]} if l.get("bend") else {}) for n, l in enumerate(result["leaders"], 1)]
+    flat_blank = result.get("blank") or {}
+    if flat_blank.get("corners"):
+        check_corners(run, scan_id, gray, flat_blank)
+    run.scans[scan_id] = {"box": box, "dimensions": dims, "shape": shape, "leaders": leaders, "blank": flat_blank,
+                          "folder": str(folder), "kind": kind, "direction": direction, "label": label}
+    # the scan is a view of its own: its crop goes to its subagent, and the model is compared with it
+    crop_png = folder / "view.png"
+    cv2.imwrite(str(crop_png), gray)
+    view = View(scan_id, label or kind.replace("_", " ").upper(), None, crop_png,
+                {"flat_pattern": "top"}.get(kind, kind))
+    view.sheet_box = box
+    view.scan = {"kind": kind, "direction": direction, "box": box}
+    if direction != "none":
+        import validate as checks
+        d = view_reader.ViewDirection[direction]
+        b = checks.ps.view_basis(d.look, d.up)
+        view.frame = {"horizontal": checks.axis_name(b[0]), "vertical": checks.axis_name(b[1]),
+                      "looking_along": checks.axis_name(np.array(d.look, float)), "source": "scan_view direction"}
+    run.views[scan_id] = view
+    # overlay with the dimension ids, and one labelled crop per dimension value
+    over = cv2.imread(str(folder / "vector_overlay.png"))
+    for d in dims:
+        mid = ((d["from_px"][0] + d["to_px"][0]) / 2, (d["from_px"][1] + d["to_px"][1]) / 2)
+        cv2.putText(over, d["id"], (int(mid[0]) + 3, int(mid[1]) - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 200), 1)
+    for l in leaders:
+        tip = tuple(int(v) for v in l["tip_px"])
+        cv2.circle(over, tip, 4, (0, 150, 0), 2)
+        cv2.putText(over, l["id"], (tip[0] + 5, tip[1] + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 150, 0), 1)
+    crops = []
+    for d in dims:
+        x0b, y0b, x1b, y1b = d["text_box_px"] or [int(min(d["from_px"][0], d["to_px"][0])),
+                                                  int(min(d["from_px"][1], d["to_px"][1])) - 20,
+                                                  int(max(d["from_px"][0], d["to_px"][0])),
+                                                  int(max(d["from_px"][1], d["to_px"][1])) + 20]
+        pad = 6
+        crop = gray[max(0, y0b - pad):y1b + pad, max(0, x0b - pad):x1b + pad]
+        if crop.size == 0:
+            continue
+        crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        tile = np.full((crop.shape[0] + 28, max(crop.shape[1], 120)), 255, np.uint8)
+        tile[28:, :crop.shape[1]] = crop
+        cv2.putText(tile, d["id"], (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 0, 2)
+        crops.append(tile)
+    images = [(f"Scan {scan_id}: part black, dimension lines red with their ids, leader arrow tips green (L1, ...), "
+               f"holes orange, outline blue" + (", the blank's bend lines magenta (B1, ...)" if flat_blank else ""),
+               cv2.imencode(".png", over)[1].tobytes())]
+    if flat_blank.get("_image") is not None:
+        x, y, w, h = flat_blank["bbox"]
+        img = flat_blank["_image"][max(0, y - 30):y + h + 30, max(0, x - 40):x + w + 40]
+        images.append((f"Scan {scan_id}: the blank's panels, each in its own colour with its id (P1 = the largest), "
+                       "and the bend lines between them in red, labelled with the two panels each joins",
+                       cv2.imencode(".png", img)[1].tobytes()))
+    view_faces = result.get("faces") or {}
+    if view_faces.get("_image") is not None:
+        images.append((f"Scan {scan_id}: the faces of this view, each in its own colour with its id (F1 = the "
+                       "largest)", cv2.imencode(".png", view_faces["_image"])[1].tobytes()))
+    if flat_blank.get("corners"):
+        x, y, w, h = flat_blank["bbox"]
+        img = raster_vector.corner_image(gray, flat_blank["contour"], flat_blank["corners"])
+        img = img[max(0, 2 * y - 40):2 * (y + h) + 40, max(0, 2 * x - 60):2 * (x + w) + 60]
+        images.append((f"Scan {scan_id}: the blank's traced outline (blue) with its corners V1..V"
+                       f"{len(flat_blank['corners'])}, in order round the outline, for trace_outline",
+                       cv2.imencode(".png", img)[1].tobytes()))
+    if crops:
+        images.append((f"Scan {scan_id}: the value text of each dimension, enlarged (rotated text stays rotated)",
+                       cv2.imencode(".png", crop_grid(crops))[1].tobytes()))
+    log.info("scan %s: %d dimension(s), %d leader(s), %d hole(s), outline closed: %s", scan_id, len(dims),
+             len(result["leaders"]), len(shape.get("holes", [])), shape.get("closed"))
+    return ToolOutput({"scan": scan_id, "box": box, "dimensions": [
+        {k: d[k] for k in ("id", "length_px", "orientation", "from_sheet", "to_sheet")} for d in dims],
+        "leaders": [{k: l[k] for k in ("id", "tip_sheet", "bend") if k in l} for l in leaders],
+        "holes_px": shape.get("holes", []),
+        "outline": {"closed": shape.get("closed"), "bbox_px": shape.get("outline_bbox")}}
+        | ({"blank": {"panels": flat_blank.get("panels"), "bend_lines": [
+            {"id": b["id"], "from_sheet": frac(b["from"]), "to_sheet": frac(b["to"])}
+            for b in flat_blank.get("bend_lines", [])],
+            "panels": [{k: p[k] for k in ("id", "bends")} for p in flat_blank.get("panels", [])],
+            "bend_lines_join": {b["id"]: b["panels"] for b in flat_blank.get("bend_lines", [])},
+            "corners": len(flat_blank.get("corners", [])),
+            "corners_dropped": (flat_blank.get("corner_check") or {}).get("dropped", []),
+            "note": "Panels are the regions the outline and the bend lines enclose; a leader with 'bend' points at "
+                    "that bend line. Reliable on a copy of the blank without dimensions (extension lines enclose "
+                    "false panels). set_dimension_values gives all of it in mm; then trace_outline turns the traced "
+                    "outline into exact lines and arcs, using the corner ids V1.. on the outline image."}}
+           if flat_blank else {})
+        | ({"faces": view_faces["faces"],
+            "faces_note": "Each region the view's edges enclose is a face of the part (F1 = the largest); 'touches' "
+                          "lists the faces it meets. On a formed part, match the blank's panels to these faces: which "
+                          "lies flat, which rise, which drop."} if view_faces.get("faces") else {})
+        | {"next": ("Read each dimension's value from its crop and call set_dimension_values with them" if dims else
+                    "No dimensions in this scan: call set_dimension_values with scale_from=<the scan of the same "
+                    "view, or another view at the same drawing scale, whose values you set>")
+                   + f". Then analyse this view with call_subagent(view_id='{scan_id}')."}, images)
+
+
+def check_corners(run: Run, scan_id: str, gray: np.ndarray, flat_blank: dict):
+    """Have a vision model judge every traced corner from a close-up, in one call, and drop the ones that are not
+    on the part (a trace that followed an arrowhead or a leader). The remaining corners are renumbered."""
+    import raster_vector
+
+    corners = flat_blank["corners"]
+    ids = [f"V{n}" for n in range(1, len(corners) + 1)]
+    x, y, w, h = flat_blank["bbox"]
+    overview = raster_vector.corner_image(gray, flat_blank["contour"], corners)
+    overview = overview[max(0, 2 * y - 40):2 * (y + h) + 40, max(0, 2 * x - 60):2 * (x + w) + 60]
+    grid = raster_vector.corner_patches(gray, flat_blank["contour"], corners)
+    content = [{"type": "text", "text": f"Scan {scan_id}: {len(corners)} traced corners, {', '.join(ids)}. "
+                                        "Judge every one."},
+               {"type": "text", "text": "Overview:"}, image_part(cv2.imencode(".png", overview)[1].tobytes()),
+               {"type": "text", "text": "Close-ups, one per corner:"},
+               image_part(cv2.imencode(".png", grid)[1].tobytes())]
+    try:
+        answer = run_agent(load_agent("corner_check"), Ctx(run, None, {"corners": ids}), content,
+                           label=f"corner_check[{scan_id}]")
+    except Exception as error:
+        log.warning("corner check of %s failed (%s): corners kept as traced", scan_id, error)
+        return
+    verdict = {c["corner"]: c for c in answer["corners"]}
+    keep = [i for i, v in zip(corners, ids) if verdict.get(v, {}).get("verdict") != "artifact"]
+    dropped = [f"{v} ({verdict[v]['reason']})" for v in ids if verdict.get(v, {}).get("verdict") == "artifact"]
+    if len(keep) >= 3:
+        flat_blank["corners"] = keep
+    flat_blank["corner_check"] = {"dropped": dropped, "on_edge": [v for v in ids
+                                                                   if verdict.get(v, {}).get("verdict") == "on_edge"]}
+    log.info("corner check %s: %d of %d corners dropped as artifacts: %s", scan_id, len(dropped), len(ids),
+             "; ".join(dropped) or "none")
+    run.trace("corner_check", scan=scan_id, verdicts=answer["corners"], dropped=dropped)
+
+
+def crop_grid(crops: list, max_width: int = 2400) -> np.ndarray:
+    """Labelled crops in rows, as many per row as fit in max_width, so the sheet stays a sensible size however
+    many dimensions a scan finds (one column of 50 crops would be taller than a model accepts)."""
+    rows, row, width = [], [], 0
+    for c in crops:
+        if row and width + c.shape[1] + 12 > max_width:
+            rows.append(row)
+            row, width = [], 0
+        row.append(c)
+        width += c.shape[1] + 12
+    if row:
+        rows.append(row)
+    lines = []
+    for r in rows:
+        height = max(c.shape[0] for c in r)
+        cells = [np.pad(c, ((0, height - c.shape[0]), (0, 12)), constant_values=255) for c in r]
+        lines.append(np.hstack(cells))
+    full = max(line.shape[1] for line in lines)
+    return np.vstack([np.pad(line, ((0, 8), (0, full - line.shape[1])), constant_values=255) for line in lines])
+
+
+def scan_frame(s: dict, px_per_mm: float):
+    """Pixels to mm in the view's own frame: origin at the lower-left corner of the blank's (or else the outline's)
+    box, x to the right, y up on the sheet."""
+    bbox = (s.get("blank") or {}).get("bbox") or s["shape"].get("outline_bbox")
+    ox, oy = (bbox[0], bbox[1] + bbox[3]) if bbox else (0, 0)
+    return lambda p: [round((p[0] - ox) / px_per_mm, 2), round((oy - p[1]) / px_per_mm, 2)]
+
+
+def leaders_in_mm(s: dict, px_per_mm: float) -> list[dict]:
+    """Leader arrow tips in mm, in the view's frame (scan_frame). On a flat pattern a BEND leader's tip lies on its
+    bend line: 'bend' names the bend line it points at."""
+    to_mm = scan_frame(s, px_per_mm)
+    return [{"id": l["id"], "tip_mm": to_mm(l["tip_px"])} | ({"bend": l["bend"]} if l.get("bend") else {})
+            for l in s["leaders"]]
+
+
+def blank_in_mm(s: dict, px_per_mm: float) -> dict:
+    """The flat blank in mm, in the view's frame (scan_frame): outline as lines and arcs, bend lines, holes."""
+    b = s.get("blank") or {}
+    if not b.get("segments"):
+        return {}
+    to_mm = scan_frame(s, px_per_mm)
+    mm = lambda v: round(v / px_per_mm, 2)
+    outline = []
+    for seg in b["segments"]:
+        if "line" in seg:
+            outline.append({"line": [to_mm(p) for p in seg["line"]]})
+        else:
+            a = seg["arc"]
+            outline.append({"arc": {"from": to_mm(a["from"]), "mid": to_mm(a["mid"]), "to": to_mm(a["to"]),
+                                    "centre": to_mm(a["centre"]), "radius": mm(a["radius"])}})
+    profile = []
+    for seg in outline:
+        if "line" in seg:
+            profile.append(seg["line"][0])
+            continue
+        a = seg["arc"]
+        c = np.array(a["centre"])
+        ang = [math.atan2(*(np.array(a[k]) - c)[::-1]) for k in ("from", "mid", "to")]
+        sweep = (ang[2] - ang[0]) % (2 * math.pi)
+        if (ang[1] - ang[0]) % (2 * math.pi) > sweep:      # the arc runs the other way round
+            sweep -= 2 * math.pi
+        steps = max(2, int(abs(math.degrees(sweep)) / 10))
+        profile += [[round(float(c[0] + a["radius"] * math.cos(ang[0] + sweep * k / steps)), 2),
+                     round(float(c[1] + a["radius"] * math.sin(ang[0] + sweep * k / steps)), 2)] for k in range(steps)]
+    panels = [{"id": p["id"], "area_mm2": round(p["area_px"] / px_per_mm ** 2, 1), "inside": to_mm(p["inside"]),
+               "bends": p["bends"]} for p in b.get("panels", [])]
+    return {"size_mm": [mm(b["bbox"][2]), mm(b["bbox"][3])], "profile": profile, "outline": outline,
+            "panels": panels,
+            "bend_lines": [{"id": bl["id"], "from": to_mm(bl["from"]), "to": to_mm(bl["to"]), "joins": bl["panels"]}
+                           for bl in b["bend_lines"]],
+            "holes": [{"centre": to_mm(h["centre"]), "d_mm": mm(h["d_px"])} for h in b["holes"]],
+            "note": "Frame: origin at the lower-left corner of the blank's box, x right, y up, as drawn. 'panels': "
+                    "the regions between the bend lines, as on the panel image, each with a point inside it (use "
+                    "that point as base_flange.fixed for the panel that stays flat) and the bends on its edges; "
+                    "each bend line 'joins' two panels. 'profile' "
+                    "is the outline as points (arcs sampled), ready for base_flange.profile. The outline "
+                    "is traced from the scan (about 0.3 mm; small steps where a leader meets the edge are tracing "
+                    "noise): use the labelled radii, diameters and sizes where they differ. Bend lines are the "
+                    "drawn ones, clipped to the blank: use them as the bends' lines."}
+
+
+def set_dimension_values(ctx: Ctx, scan: Annotated[str, "The scan id returned by scan_view, e.g. S1"],
+                         values: Annotated[str, "JSON object of the values you read, by dimension id, in mm, e.g. "
+                                                "'{\"D1\": 61, \"D2\": 52.2}'. Leave out any you cannot read"] = "{}",
+                         scale_from: Annotated[str, "For a scan with too few dimensions: the id of a scan at the same "
+                                                    "drawing scale whose values are set (e.g. the dimensioned copy "
+                                                    "of the same blank); its scale is used"] = "") -> dict:
+    """Fit one mm-per-pixel scale to the dimension values you read, check every dimension against it (a misread
+    value or a wrong arrow pairing shows as a large error), and convert the scan's geometry to mm. A scan without
+    dimensions takes the scale of another scan (scale_from), checked against that scan's overall sizes."""
+    run = ctx.run
+    if scan not in run.scans:
+        raise ValueError(f"Unknown scan {scan!r}; use one of {sorted(run.scans)}")
+    s = run.scans[scan]
+    read = {k: float(v) for k, v in json.loads(values or "{}").items()}
+    pairs = [(d, read[d["id"]]) for d in s["dimensions"] if d["id"] in read and read[d["id"]] > 0]
+    scale_check = None
+    if len(pairs) < 2 and scale_from:
+        ref = run.scans.get(scale_from)
+        if not ref or not ref.get("scale_px_per_mm"):
+            raise ValueError(f"Scan {scale_from!r} has no scale yet: set its dimension values first")
+        px_per_mm = ref["scale_px_per_mm"]
+        # the same part at the same drawing scale: its size here should match the overall sizes read there
+        bbox = (s.get("blank") or {}).get("bbox") or s["shape"].get("outline_bbox")
+        largest = {o: max([v for d, v in ref.get("values", []) if d["orientation"] == o], default=None)
+                   for o in ("horizontal", "vertical")}
+        if bbox:
+            # a second copy is often drawn at a slightly different scale: when its size matches an overall value
+            # read on the other scan (within 5%), take the scale from that size instead
+            overall = [bbox[2 if o == "horizontal" else 3] / largest[o] for o in ("horizontal", "vertical")
+                       if largest[o] and abs(bbox[2 if o == "horizontal" else 3] / px_per_mm - largest[o])
+                       <= 0.05 * largest[o]]
+            if overall:
+                px_per_mm = float(np.mean(overall))
+            size = {"horizontal": bbox[2] / px_per_mm, "vertical": bbox[3] / px_per_mm}
+            # no part is smaller than its largest dimension; larger is fine when its overall size is not dimensioned
+            scale_check = {o: {"size_here_mm": round(size[o], 1), "largest_value_there_mm": largest[o],
+                               "ok": largest[o] is None or size[o] >= largest[o] - max(2.0, 0.05 * largest[o])}
+                           for o in size}
+    elif len(pairs) < 2:
+        raise ValueError("Give at least two dimension values to fit the scale, or scale_from=<a scan at the same "
+                         "drawing scale whose values are set>")
+    else:
+        px_per_mm = float(np.median([d["length_px"] / v for d, v in pairs]))
+        s["values"] = pairs
+    checks = []
+    for d, v in pairs:
+        measured = d["length_px"] / px_per_mm
+        error = (measured - v) / v * 100
+        checks.append({"id": d["id"], "value": v, "measured_mm": round(measured, 2), "error_pct": round(error, 1),
+                       "ok": abs(error) <= 3})
+    shape = s["shape"]
+    mm = lambda px: round(px / px_per_mm, 2)
+    s["scale_px_per_mm"] = px_per_mm
+    result = {"scan": scan, "px_per_mm": round(px_per_mm, 4),
+              "dimensions_checked": checks,
+              "suspect": [c["id"] for c in checks if not c["ok"]],
+              "holes_mm": [{"centre_px": h["centre"], "d_mm": mm(h["d_px"])} for h in shape.get("holes", [])],
+              "outline": {"closed": shape.get("closed"),
+                          "size_mm": [mm(v) for v in shape.get("outline_bbox", [0, 0, 0, 0])[2:]]},
+              "leaders_mm": leaders_in_mm(s, px_per_mm),
+              "note": "A suspect dimension was misread or paired wrongly: re-read its crop, or leave it out. Hole "
+                      "and outline sizes come from image processing and are approximate; dimension values win."}
+    if scale_from and scale_check is not None:
+        result["scale_from"] = {"scan": scale_from, "check": scale_check,
+                                "scale": ("fitted to the overall size read there" if px_per_mm !=
+                                          run.scans[scale_from]["scale_px_per_mm"] else
+                                          "copied: no overall value read there matches this scan's size; read the "
+                                          "overall width and height on that scan if they are dimensioned"),
+                                "note": "At the same scale the part here is at least as large as the largest "
+                                        "value read on that scan (equal when that value is the overall size). Not "
+                                        "ok: the two are not at the same scale; do not use this scan's mm."}
+    if s.get("blank"):
+        result["blank_mm"] = blank_in_mm(s, px_per_mm)
+    run.trace("scan_values", scan=scan, values=read, result=result)
+    log.info("scan %s: %.3f px/mm from %d value(s); suspect: %s", scan, px_per_mm, len(pairs),
+             result["suspect"] or "none")
+    return result
+
+
+def trace_outline(ctx: Ctx, scan: Annotated[str, "The scan id of a flat blank (scan_view kind flat_pattern)"],
+                  spans: Annotated[str, "JSON list, in order round the outline, of what each stretch between two "
+                                        "corners is: {\"from\": \"V3\", \"to\": \"V7\", \"kind\": \"line\" | "
+                                        "\"arc\", \"radius\": 25 (mm, the labelled radius; leave out to fit it), "
+                                        "\"corner_radius\": 2 (mm, rounds the corner where this line meets the "
+                                        "next line)}. Stretches you leave out stay as traced"]) -> ToolOutput:
+    """Turn a scanned blank's traced outline into exact lines and arcs. You say what each stretch between two
+    numbered corners is (from the outline image of scan_view and the drawing's radius callouts); each is fitted to
+    the scanned edge with a robust fit (leader lines crossing the edge are ignored), a labelled radius is kept
+    exactly, and the pieces are joined where they meet. Returns the outline in mm (same frame as blank_mm), a
+    report per stretch (a stretch not ok was labelled wrongly: split it at another corner, or change its kind or
+    radius, and call again) and an image of the fit."""
+    import outline_fit
+    import raster_vector
+
+    run = ctx.run
+    s = run.scans.get(scan)
+    if not s or not (s.get("blank") or {}).get("corners"):
+        raise ValueError(f"{scan!r} has no traced blank: trace_outline works on a scan_view of kind flat_pattern")
+    px_per_mm = s.get("scale_px_per_mm")
+    if not px_per_mm:
+        raise ValueError(f"Set the scale of {scan} first: set_dimension_values (with scale_from if it has no dimensions)")
+    b = s["blank"]
+    fit = outline_fit.fit_outline(b["contour"], b["corners"], json.loads(spans), px_per_mm)
+    to_mm = scan_frame(s, px_per_mm)
+    outline = []
+    for p in fit["pieces"]:
+        if p["kind"] == "arc":
+            arc = outline_fit.arcs([p])[0]
+            outline.append({"arc": {k: to_mm(arc[k]) for k in ("from", "mid", "to", "centre")}
+                            | {"radius": round(p["r"] / px_per_mm, 2)}})
+        else:
+            outline.append({"line": [to_mm(p["start"]), to_mm(p["end"])]})
+    profile = [to_mm(p) for p in outline_fit.sample(fit["pieces"])]
+    xs, ys = np.array(profile).T
+    area = 0.5 * abs(float(xs @ np.roll(ys, 1) - ys @ np.roll(xs, 1)))
+    s["outline_fit"] = {"spans": json.loads(spans), "profile": profile}
+    x, y, w, h = b["bbox"]
+    gray = cv2.imread(str(Path(s["folder"]) / "view.png"), cv2.IMREAD_GRAYSCALE)
+    img = raster_vector.corner_image(gray, b["contour"], b["corners"], fit["pieces"])
+    img = img[max(0, 2 * y - 40):2 * (y + h) + 40, max(0, 2 * x - 60):2 * (x + w) + 60]
+    bad = [f"{e.get('from', e.get('corner'))}->{e.get('to', '')}" for e in fit["report"] if not e["ok"]]
+    log.info("outline %s: %d piece(s), area %.0f mm2, not ok: %s", scan, len(fit["pieces"]), area, bad or "none")
+    run.trace("outline_fit", scan=scan, spans=json.loads(spans), report=fit["report"])
+    return ToolOutput({"scan": scan, "fits": fit["report"], "not_ok": bad, "outline": outline, "profile": profile,
+                       "area_mm2": round(area, 1),
+                       "note": "Frame as blank_mm (origin at the blank's lower-left corner, x right, y up). on_edge: "
+                               "share of the traced edge within 1.5 px of the fitted piece; ok needs 0.6. 'profile' "
+                               "is the outline as points with the arcs sampled: use it as base_flange.profile."},
+                      [(f"Scan {scan}: fitted outline (red) over the traced one (blue), corners V1..", 
+                        cv2.imencode(".png", img)[1].tobytes())])
+
+
 Millimetres = Annotated[float, "mm along the overlay's axis, as labelled on the overlay image"]
 
 
@@ -542,7 +946,8 @@ def zoom_comparison(ctx: Ctx, h_from: Millimetres, h_to: Millimetres,
     return ToolOutput({"shown": caption}, [(caption, buffer.getvalue())])
 
 
-TOOLS = {f.__name__: f for f in (view_drawing, read_drawing_text, split_views, call_subagent,
+TOOLS = {f.__name__: f for f in (scan_view, set_dimension_values, trace_outline,
+                                 view_drawing, read_drawing_text, split_views, call_subagent,
                                  read_view_text, zoom_view, run_cadquery, zoom_comparison, extend_view)}
 JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
@@ -581,7 +986,17 @@ def view_image(view: View) -> bytes:
         return png_of(doc[0], long_side=1400)
 
 
+MAX_IMAGE_SIDE = 4000  # providers refuse images over 8000 px on a side; stay well under it
+
+
 def image_part(png: bytes) -> dict:
+    """An image for a model message, scaled down if a side is longer than MAX_IMAGE_SIDE."""
+    image = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is not None and max(image.shape[:2]) > MAX_IMAGE_SIDE:
+        scale = MAX_IMAGE_SIDE / max(image.shape[:2])
+        image = cv2.resize(image, (max(1, int(image.shape[1] * scale)), max(1, int(image.shape[0] * scale))),
+                           interpolation=cv2.INTER_AREA)
+        png = cv2.imencode(".png", image)[1].tobytes()
     return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}
 
 
@@ -598,6 +1013,7 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
     alog.info("started (%d tools, max %d turns)", len(tools), max_turns)
     run.trace("agent_start", agent=label, tools=agent.tools)
 
+    used: set[str] = set()
     stopped = False
     for turn in range(1, max_turns + REPAIR_TURNS + 1):  # extra turns only for fixing a rejected answer
         last = turn >= max_turns or run.over_budget
@@ -628,12 +1044,24 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
                   tool_calls=[{"name": c.function.name, "arguments": c.function.arguments} for c in calls])
 
         if not calls:
+            missing = missing_steps(agent, run, used)
+            if missing and not stopped:
+                # a reply in the middle of the work (an overview written out, a thought) is not the final answer
+                alog.info("reply before the workflow is done; still to call: %s", ", ".join(missing))
+                run.trace("not_done", agent=label, turn=turn, missing=missing)
+                messages += [{"role": "assistant", "content": message.content or ""},
+                             {"role": "user", "content": "Not finished yet: the workflow still needs "
+                              + ", ".join(f"`{m}`" for m in missing) + ". Continue with the next step, using "
+                              "your tools. Reply with the final JSON only when every step is done."}]
+                continue
             try:
                 result = parse_json(message.content or "")
                 if agent.output_model:
                     context = {"views": list(run.views)}
                     if agent.output_model is schema.ArbiterReport:
                         context["texts"] = drawing_texts(run)
+                    if ctx.check and "corners" in ctx.check:
+                        context["corners"] = ctx.check["corners"]
                     result = agent.output_model.model_validate(result, context=context).model_dump(mode="json")
             except (ValueError, ValidationError) as error:
                 problem = validation_problems(error)
@@ -648,6 +1076,7 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
             run.trace("agent_end", agent=label, result=result, cost_usd=agent_cost)
             return result
 
+        used |= {c.function.name for c in calls}
         messages.append({"role": "assistant", "content": message.content or "", "tool_calls": [
             {"id": c.id, "type": "function", "function": {"name": c.function.name, "arguments": c.function.arguments}}
             for c in calls]})
@@ -666,6 +1095,15 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
             messages.append({"role": "user", "content": parts})
 
     raise RuntimeError(f"{label} gave no valid answer in {max_turns} turns (+{REPAIR_TURNS} repair turns)")
+
+
+def missing_steps(agent: Agent, run: Run, used: set[str]) -> list[str]:
+    """Tools the agent's YAML requires before it may give its final answer (`required_tools`, plus
+    `required_tools_scanned` when the sheet is a scan), that it has and has not used yet."""
+    required = list(agent.settings.get("required_tools") or [])
+    if run.scanned:
+        required += agent.settings.get("required_tools_scanned") or []
+    return [t for t in required if t in agent.tools and t not in used]
 
 
 def execute(name: str, arguments: str, ctx: Ctx, tools: list, alog: logging.Logger):
@@ -879,15 +1317,24 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
         shutil.copyfile(run.dir / name, out_dir / name)
     vlog = log.getChild("validate")
     result = {"round": round_no, "reports": [], "pose": None, "measured": []}
-    if not any(v.pdf for v in run.views.values()):
-        vlog.warning("no vector views to compare with (scanned drawing?); model not validated")
+    scanned = [v for v in run.views.values() if v.scan]
+    if not any(v.pdf for v in run.views.values()) and not scanned:
+        vlog.warning("no vector views and no scanned views to compare with; model not validated")
         return result
     t0 = time.monotonic()
+    if scanned:  # a scan: compare with the part edges image processing separated in each scanned view
+        scans_json = out_dir / "scans.json"
+        scans_json.write_text(json.dumps([{"id": v.id, "label": v.label, **v.scan,
+                                           "px_per_mm": run.scans[v.id].get("scale_px_per_mm"),
+                                           "folder": run.scans[v.id].get("folder")} for v in scanned],
+                                         indent=1), encoding="utf-8")
+        command = [sys.executable, str(ROOT / "src" / "raster_check.py"), str(run.drawing),
+                   str(run.dir / "model.step"), str(scans_json), str(out_dir)]
+    else:
+        command = [sys.executable, str(ROOT / "src" / "validate.py"), str(run.dir / "views"),
+                   str(run.dir / "model.step"), str(out_dir), str(run.drawing)]
     try:
-        subprocess.run([sys.executable, str(ROOT / "src" / "validate.py"), str(run.dir / "views"),
-                        str(run.dir / "model.step"), str(out_dir), str(run.drawing)], cwd=ROOT / "src",
-                       timeout=VALIDATE_TIMEOUT_S,
-                       capture_output=True, text=True)
+        subprocess.run(command, cwd=ROOT / "src", timeout=VALIDATE_TIMEOUT_S, capture_output=True, text=True)
         data = json.loads((out_dir / "validation.json").read_text(encoding="utf-8"))
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
         vlog.warning("projection check failed: %s; model not validated", error)
@@ -897,7 +1344,8 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
     vlog.info("projections done in %.1fs; pose: %s", time.monotonic() - t0, (data.get("pose") or {}).get("verdict"))
     run.trace("projections", round=round_no, data=data)
 
-    by_pdf = {v.pdf.stem: v for v in run.views.values() if v.pdf}
+    by_pdf = {v.pdf.stem: v for v in run.views.values() if v.pdf} | {v.id: v for v in scanned}
+    mark_unknown_cameras(data["views"], vlog)
     tree = plan_result["feature_tree"]
     compact = [{k: f.get(k) for k in ("id", "name", "op", "params", "on", "position", "direction", "pattern")}
                for f in tree["features"]]
@@ -912,6 +1360,7 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
                  f"{entry['looking_along']}" + (f", cut plane normal {entry['cut_plane_normal']}"
                                                 if entry.get("cut_plane_normal") else "") + ".")
         measured = {k: entry.get(k) for k in ("metrics", "missing_regions", "extra_regions", "callouts", "note",
+                                              "class", "camera", "scale_mm_per_px", "orientation", "camera_doubt",
                                               "parent_view", "cut_offset_mm", "side_note", "orientation_note",
                                               "direction_note")
                     if entry.get(k) is not None}
@@ -966,21 +1415,40 @@ def screen_orientation_issues(report: dict, entry: dict, pose: dict, vlog: loggi
     return {**report, "issues": kept, "notes": notes, "verdict": verdict, "orientation": orientation}
 
 
+def mark_unknown_cameras(entries: list[dict], vlog: logging.Logger, good: float = 0.6, poor: float = 0.4):
+    """A scanned isometric is compared from the four standard isometric cameras only. When another isometric of
+    the same model fits well and this one fits poorly, the model is the same in both: this view's camera is
+    most likely not a standard one (a turned or dimetric view), so its mismatch is not evidence against the model."""
+    iso = [e for e in entries if e.get("class") == "isometric" and e.get("metrics")]
+    fits = lambda e, v: e["metrics"]["drawn_covered"] >= v and e["metrics"]["model_covered"] >= v
+    if not any(fits(e, good) for e in iso):
+        return
+    for e in iso:
+        if e["metrics"]["drawn_covered"] < poor or e["metrics"]["model_covered"] < poor:
+            e["camera_doubt"] = ("Another isometric view of this model fits well, this one does not: its camera is "
+                                 "probably not one of the four standard isometric ones tried, so the mismatch may be "
+                                 "the camera, not the model.")
+            vlog.info("%s: poor fit while another isometric fits well; camera in doubt", e["view_id"])
+
+
 def weigh_by_evidence(report: dict, entry: dict, vlog: logging.Logger) -> dict:
     """An issue is only as strong as what backs it. In a measured view (projection metrics and callout checks)
     issues keep their severity. In a view that could not be measured (a pictorial view, judged by eye), they
-    become advisory: low severity, so they never start a correction round on their own."""
+    become advisory: low severity, so they never start a correction round on their own. In a view whose camera is
+    in doubt (mark_unknown_cameras), high issues become low the same way."""
     measured = "metrics" in entry
+    doubt = entry.get("camera_doubt")
     issues = []
     for issue in report["issues"]:
-        issue = {**issue, "basis": "measured view" if measured else "visual only: this view was not measured"}
-        if not measured and issue["severity"] == "high":
-            vlog.info("    advisory only (view not measured): %s %s", issue.get("feature") or "-",
-                      issue["description"][:120])
+        issue = {**issue, "basis": "measured view" if measured and not doubt else
+                 "camera in doubt: " + doubt if doubt else "visual only: this view was not measured"}
+        if issue["severity"] == "high" and (not measured or doubt):
+            vlog.info("    advisory only (%s): %s %s", "camera in doubt" if doubt else "view not measured",
+                      issue.get("feature") or "-", issue["description"][:120])
             issue["severity"] = "low"
         issues.append(issue)
     verdict = report["verdict"]
-    if not measured and verdict == "fail":
+    if (not measured or doubt) and verdict == "fail":
         verdict = "minor"
     return {**report, "issues": issues, "verdict": verdict}
 
