@@ -8,6 +8,7 @@ dependencies = [
   "openai==2.8.1",
   "python-dotenv>=1.2.4",
   "pymupdf>=1.26,<2",
+  "opencv-python-headless>=5.0.0.93",
 ]
 
 [tool.uv]

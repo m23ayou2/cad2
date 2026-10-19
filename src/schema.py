@@ -16,8 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 # --------------------------------------------------------------------------- operations
 # Fixed list, from the operations that appear on mechanical detail drawings. Anything
-# else (gear teeth, sheet metal, weldments, surfaces, engraving) is not an operation:
-# it goes in FeatureTree.unsupported, so the part is flagged instead of guessed.
+# else (gear teeth, weldments, surfaces, engraving) is not an operation: it goes in
+# FeatureTree.unsupported, so the part is flagged instead of guessed. Sheet metal is
+# built from a flat blank (base_flange) folded along its bend lines (src/sheet_metal.py).
 Op = Literal[
     # core shape
     "extrude_boss", "revolve_boss", "extrude_cut", "revolve_cut", "boolean",
@@ -25,6 +26,8 @@ Op = Literal[
     # holes and edges
     "hole", "counterbore_hole", "countersink_hole", "tapped_hole", "external_thread",
     "slot", "keyway", "chamfer", "fillet", "knurl",
+    # sheet metal
+    "base_flange", "bend", "edge_flange",
 ]
 
 # Parameters each operation needs. A tuple means "at least one of these".
@@ -47,6 +50,9 @@ REQUIRED_PARAMS: dict[str, list[str | tuple[str, ...]]] = {
     "keyway": ["width", "depth", "length"],
     "chamfer": ["size"],
     "fillet": ["r"],
+    "base_flange": ["profile", "thickness"],   # profile: the flat blank [[x, y], ...]
+    "bend": ["line", "angle", "direction"],     # line: [[x1, y1], [x2, y2]] across the flat blank
+    "edge_flange": ["length", "angle"],
 }
 
 CHECK_RE = re.compile(r"^(bbox|volume|projection:[a-z0-9_,]+|cylinder:[a-z0-9_.=,]+|count:[a-z0-9_.=,]+)$")
@@ -226,7 +232,8 @@ class Feature(Strict):
                 missing.append(" or ".join(options))
         if missing:
             raise ValueError(f"{self.id} ({self.op}) is missing param(s): {', '.join(missing)}")
-        if self.position is None and not self.placements:
+        # sheet-metal operations are placed by their profile and bend line, in the blank's frame
+        if self.position is None and not self.placements and self.op not in ("base_flange", "bend", "edge_flange"):
             raise ValueError(f"{self.id} has no position: give `position` [x, y, z], or `placements` with one "
                              f"entry per instance")
         if self.placements and self.pattern and self.pattern.type != "single":
@@ -402,7 +409,116 @@ class ArbiterReport(Strict):
     notes: list[str] = Field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- path agent (one region of a view)
+PathOp = Literal[
+    "extrude_boss", "revolve_boss", "extrude_cut", "revolve_cut", "boolean", "sweep", "loft", "shell", "rib",
+    "draft", "thicken", "hole", "counterbore_hole", "countersink_hole", "tapped_hole", "external_thread", "slot",
+    "keyway", "chamfer", "fillet", "knurl", "base_flange", "bend", "edge_flange", "flat_pattern", "none",
+]
+
+
+class PathDimension(Strict):
+    """A dimension or callout that sizes or places this region."""
+    text: str = Field(description="Exactly as printed, e.g. 'R25', 'Ø7 THRU', '47.8'")
+    value: float | None = Field(None, description="The number in mm or degrees, if any")
+    kind: Literal["length", "diameter", "radius", "angle", "position", "thickness", "count", "note", "other"]
+    measures: str = Field(description="What it measures on this region, e.g. 'width of P3', 'radius of the arc on "
+                                      "P1's right edge', 'position of the hole from the left edge'")
+
+
+class PathEdge(Strict):
+    """One stretch of the region's boundary, in order round it."""
+    kind: Literal["line", "arc", "circle", "spline", "unclear"]
+    where: str = Field(description="Where it is, e.g. 'top edge', 'lower-right corner', 'shared with P2'")
+    boundary_of: Literal["part_outline", "bend_line", "inner_edge", "hole", "annotation", "unclear"] = Field(
+        description="What this stretch is on the drawing: the part's outer outline, a bend line, an edge between "
+                    "two faces, a hole, or an annotation line (dimension, leader, extension, centre line)")
+    dimension: str | None = Field(None, description="The text of the dimension that sizes this stretch, if any")
+
+
+class PathNeighbour(Strict):
+    region: str = Field(pattern=r"^P\d+$")
+    relation: Literal["bend", "edge_between_faces", "step", "same_surface", "contains", "inside",
+                      "annotation_split", "unclear"] = Field(
+        description="bend: a bend line separates them; edge_between_faces: they are two faces meeting at an edge "
+                    "(pictorial view); step: a change of level; same_surface: one face cut in two by an annotation "
+                    "or centre line; contains / inside: one lies inside the other (a hole in a face); "
+                    "annotation_split: the boundary between them is only a dimension or leader line")
+    note: str = ""
+
+
+class PathCreate(Strict):
+    """How to make this region in CAD."""
+    op: PathOp
+    params: dict[str, ParamValue] = Field(default_factory=dict, description="Values in mm / degrees, named as in "
+                                                                            "the feature tree (d, r, width, length, "
+                                                                            "height, thickness, angle, ...)")
+    sketch: str = Field("", description="The profile to sketch, in words with numbers, e.g. 'rectangle 61 x 18 "
+                                        "with R2 corners on the left'")
+    on: str = Field("", description="Where it starts / which face or plane, in words")
+    depends_on: list[str] = Field(default_factory=list, description="Regions it is built on, e.g. ['P1']")
+
+
+class PathReport(Strict):
+    """The path agent's analysis of one region (path) of one view."""
+    view: str
+    region: str = Field(pattern=r"^P\d+$")
+    role: Literal["part_face", "panel", "hole_or_cutout", "section_cut", "background", "annotation",
+                  "unclear"] = Field(description="part_face: a face of the part (pictorial or orthographic view); "
+                                                 "panel: a panel of a sheet-metal flat blank, between bend lines; "
+                                                 "hole_or_cutout: an opening in the part; section_cut: cut material "
+                                                 "in a section; background: empty paper enclosed by lines (between "
+                                                 "dimension or extension lines); annotation: inside text, an "
+                                                 "arrow or a symbol")
+    description: str = Field(description="What this region is, in one or two sentences")
+    shape: Literal["rectangle", "rounded_rectangle", "circle", "ring", "slot", "polygon", "arc_band", "irregular",
+                   "other"]
+    edges: list[PathEdge] = Field(default_factory=list)
+    dimensions: list[PathDimension] = Field(default_factory=list)
+    size_mm: list[float] = Field(default_factory=list, description="Overall width and height of the region in mm "
+                                                                   "when the dimensions give them")
+    neighbours: list[PathNeighbour] = Field(default_factory=list)
+    create: PathCreate | None = Field(None, description="Leave out for background and annotation regions")
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def create_for_geometry(self) -> PathReport:
+        if self.role in ("part_face", "panel", "hole_or_cutout", "section_cut") and self.create is None:
+            raise ValueError(f"{self.region}: a {self.role} needs `create` (how to make it)")
+        return self
+
+
+class CornerVerdict(Strict):
+    """One traced corner, judged from its patch."""
+    corner: str = Field(pattern=r"^V\d+$", description="The corner id written on its patch, e.g. V7")
+    verdict: Literal["real_corner", "on_edge", "artifact"] = Field(
+        description="real_corner: the part's outline really turns here (a corner, or where a line meets an arc); "
+                    "on_edge: the point lies on the part's edge but the edge does not turn here (along a straight "
+                    "line or a smooth arc); artifact: the blue trace is not on the part's edge here (it follows an "
+                    "arrowhead, a leader, a dimension or extension line, a centre line or text, or cuts a corner)")
+    reason: str = Field(description="What you see in the patch, in a few words")
+
+
+class CornerCheck(Strict):
+    """The answer of the corner check: one verdict per corner shown."""
+    corners: list[CornerVerdict]
+    notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def every_corner_once(self, info: ValidationInfo) -> CornerCheck:
+        shown = (info.context or {}).get("corners")
+        given = [c.corner for c in self.corners]
+        if shown:
+            missing = [c for c in shown if c not in given]
+            extra = sorted({c for c in given if c not in shown})
+            twice = sorted({c for c in given if given.count(c) > 1})
+            if missing or extra or twice:
+                raise ValueError(f"answer every corner shown exactly once; missing {missing}, unknown {extra}, "
+                                 f"answered twice {twice}")
+        return self
+
+
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
-    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport,
+    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport, PathReport, CornerCheck,
 )}
