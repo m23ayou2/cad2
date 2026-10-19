@@ -256,10 +256,91 @@ class Unsupported(Strict):
     evidence: list[str] = Field(default_factory=list)
 
 
+AXIS_VEC = {"+X": (1, 0, 0), "-X": (-1, 0, 0), "+Y": (0, 1, 0), "-Y": (0, -1, 0), "+Z": (0, 0, 1), "-Z": (0, 0, -1)}
+
+
+class FrameView(Strict):
+    """How one view of the drawing sits in the part frame: the direction the camera looks along, and which part
+    axes point right and up in the image (front view: looks along +Y, right +X, up +Z)."""
+    view: str
+    looks_along: Axis
+    image_right: Axis
+    image_up: Axis
+
+    @model_validator(mode="after")
+    def a_real_camera(self) -> FrameView:
+        import numpy as np
+        look, right, up = (np.array(AXIS_VEC[a]) for a in (self.looks_along, self.image_right, self.image_up))
+        if abs(look @ right) or abs(look @ up) or abs(right @ up):
+            raise ValueError(f"{self.view}: looks_along, image_right and image_up must be three different axes")
+        if not np.array_equal(np.cross(right, up), -look):
+            raise ValueError(f"{self.view}: right {self.image_right} and up {self.image_up} seen along "
+                             f"{self.looks_along} is a mirrored image; looking along {self.looks_along} with up "
+                             f"{self.image_up}, image right is {AXIS_NAMES[tuple(np.cross(look, up))]}")
+        return self
+
+
+AXIS_NAMES = {v: k for k, v in AXIS_VEC.items()}
+
+
+class FrameRevision(Strict):
+    round: int
+    change: str = Field(description="What changed in the frame, for the whole part, e.g. 'rotated 90 deg about Z'")
+    reason: str
+    views: list[str] = Field(min_length=2, description="At least two independent views that show the old frame "
+                                                       "was wrong")
+
+
 class Frame(Strict):
-    origin: str = Field(description="e.g. 'centre of the bottom face'")
-    x: str = Field(description="e.g. 'front-view horizontal'")
+    """The frame card: how the part is set up, decided before any feature (step 0) and kept for the whole run."""
+    family: Literal["prismatic", "turned", "sheet_metal", "mixed"]
+    resting_face: str = Field(description="The face at z = 0 and why: datum A, the mounting face, or the largest "
+                                          "flat face")
+    z_origin: Literal["resting_face", "mid_thickness"] = Field(
+        "resting_face", description="resting_face: z = 0 on the resting face, part above; mid_thickness: a part "
+                                    "symmetric through its thickness, centred on z = 0")
+    origin_rule: Literal["symmetry_centre", "datum_corner", "datum_feature"] = Field(
+        description="symmetry_centre: dimensions are symmetric (centre lines, +/- values); datum_corner: ordinate "
+                    "or baseline dimensions start from a corner or edge; datum_feature: they start from a hole or bore")
+    origin: str = Field(description="Where x = y = 0 is, e.g. 'centre of the bottom face', 'lower-left corner of "
+                                    "the flat blank, where its ordinate dimensions start'")
+    origin_evidence: list[str] = Field(default_factory=list,
+                                       description="Dimensions measured from the origin, as printed")
+    x: str = Field(description="What X follows, e.g. 'front-view horizontal'")
     z: Literal["up"] = "up"
+    axis: Literal["X", "Y", "Z"] | None = Field(None, description="Turned parts: the axis of revolution (Z unless "
+                                                                  "the drawing forces another)")
+    axis_reason: str = Field("", description="Why the axis is not Z, if it is not")
+    projection: Literal["first_angle", "third_angle", "unknown"] = "unknown"
+    projection_evidence: str = Field("", description="The symbol, or the view layout and the isometric")
+    views: list[FrameView] = Field(default_factory=list, description="Every orthographic view and section")
+    expected_bbox_mm: list[float] = Field(min_length=3, max_length=3, description="Overall size along X, Y, Z "
+                                                                                  "from the overall dimensions")
+    bbox_evidence: str = Field(description="The overall dimensions behind expected_bbox_mm, as printed")
+    revisions: list[FrameRevision] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def setup_rules(self, info: ValidationInfo) -> Frame:
+        if any(v <= 0 for v in self.expected_bbox_mm):
+            raise ValueError("frame.expected_bbox_mm: three positive sizes, along X, Y and Z")
+        if self.family == "turned" and self.axis is None:
+            raise ValueError("frame.axis: a turned part needs its axis of revolution (Z by the setup standard)")
+        if self.axis not in (None, "Z") and not self.axis_reason:
+            raise ValueError(f"frame.axis is {self.axis}: say in axis_reason why the axis is not Z")
+        # the card is frozen: a revision may change it only through a recorded revision
+        previous = (info.context or {}).get("previous_frame")
+        if previous:
+            keys = ("family", "z_origin", "origin_rule", "origin", "axis", "expected_bbox_mm")
+            default = lambda k: Frame.model_fields[k].default
+            changed = [k for k in keys if previous.get(k, default(k)) != getattr(self, k)]
+            old_views = {v["view"]: (v["looks_along"], v["image_right"], v["image_up"]) for v in previous.get("views", [])}
+            changed += [f"views.{v.view}" for v in self.views
+                        if v.view in old_views and old_views[v.view] != (v.looks_along, v.image_right, v.image_up)]
+            if changed and len(self.revisions) <= len(previous.get("revisions", [])):
+                raise ValueError(f"the frame card is frozen: {changed} changed without a revision. Keep the frame, "
+                                 "or add a `revisions` entry (the whole-part change, its reason, and at least two "
+                                 "views that show the old frame was wrong)")
+        return self
 
 
 class FeatureTree(Strict):

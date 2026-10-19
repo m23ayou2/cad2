@@ -79,7 +79,29 @@ Each subagent returns a view summary: its dimensions, its feature **hypotheses**
 - **Answer each `cannot_tell`** from another view. What no view answers becomes a derived value or an assumption.
 - **Check coverage**: every dimension in every summary must end up in a feature. A leftover dimension means a missed feature. Every isometric hypothesis must be matched by a feature.
 
-## 5. Plan the part: build the feature tree
+## 5. Set up the part, before the first feature (the frame card)
+
+A wrong first guess at the part's orientation spoils everything after it: every feature, check and correction then reasons inside the wrong frame. So set the part up first, the way a CAD modeller does before the first sketch, by this standard, and write it in `feature_tree.frame` (the **frame card**):
+
+1. **Family** (`family`): `prismatic` (plate, block, bracket, milled from stock), `turned` (symmetric about an axis, made on a lathe), `sheet_metal` (a flat pattern, a thickness note or bends), or `mixed` (a prismatic body with turned features: treat it as prismatic).
+2. **The resting face is the XY plane, the part above it** (`resting_face`, `z_origin`): datum A if the drawing marks one; else the mounting face (bolt holes through it, or the face the part sits on in the isometric); else the largest flat face. It goes at z = 0, facing -Z, all material at z >= 0. A part symmetric through its thickness is centred on z = 0 instead (`z_origin: mid_thickness`).
+3. **The origin is where the drawing measures from** (`origin_rule`, `origin`, `origin_evidence`):
+   - dimensions symmetric (centre lines, +/- values, sizes split equally): `symmetry_centre`, x = y = 0 at the centre;
+   - ordinate or baseline dimensions starting from a corner or edge: `datum_corner`, x = y = 0 at that corner, x and y measured as the drawing measures them;
+   - dimensions starting from a hole or bore: `datum_feature`, the origin on its centre.
+   Quote in `origin_evidence` the dimensions that start at the origin.
+4. **X and Y follow the front view** (`x`, `views`): the front view's horizontal is +X (to the right), its vertical +Z, so the front view looks along +Y; the top view looks along -Z (right +X, up +Y); the right view along -X (right +Y, up +Z). If no view is labelled front, the front is the view showing the most shape; its longest horizontal size is usually X. The projection method (`projection`, `projection_evidence`) decides which view is the top or the bottom and the left or the right: from the symbol in the title block, else from the layout, confirmed by the isometric (by default it shows the front, right and top faces). List every orthographic view and section in `views` with the axis it looks along and the part axes that point right and up in its image; the harness checks that each is a real (not mirrored) camera.
+5. **Turned parts: the axis is Z** (`axis`): the base end (the flange or largest diameter) at z = 0, extending to +Z, the axis through x = y = 0. The view showing concentric circles is the top view, whatever the drawing calls it. Another axis only when the drawing forces it, with `axis_reason`.
+6. **Sheet metal**: the panel that stays flat (lying down in the isometric) in XY, z from 0 to the thickness, flanges rising to +Z; the blank's coordinates are the flat pattern's own frame, its origin where its ordinates start (`datum_corner`).
+7. **Expected size** (`expected_bbox_mm`, `bbox_evidence`): the overall size along X, Y and Z, from the overall dimensions mapped through the card.
+
+**Check the card before the first feature:** the overall dimensions must land on the axes the card says; symmetric dimensions must be symmetric about the origin; the resting face must be at z = 0. If one fails, fix the card now.
+
+**Then build every feature inside the card.** The base feature is sketched on XY from the view that shows its true outline and extruded along +Z; every other feature references a face already built; symmetric features are placed symmetric about the origin's planes, never by separately guessed coordinates.
+
+**The card is frozen for the whole run.** No later step may flip, mirror or re-orient one feature, one view or one hole pattern to make it fit. A change of frame is a separate decision: only for the whole part ("rotate the part 90 deg about Z"), only when at least two independent views (or the orientation check) show the card is wrong, and recorded in `frame.revisions`. The harness rejects any other change to the card, translates the built model so the card's rules hold (never rotating it), and checks the built size along X, Y and Z against `expected_bbox_mm`: sizes on the wrong axes come back as an orientation issue.
+
+## 6. Plan the part: build the feature tree
 
 Write **one feature tree for the whole part**, in the order a CAD modeller would build it. Each feature has:
 
@@ -129,7 +151,7 @@ Write **one feature tree for the whole part**, in the order a CAD modeller would
 
 Order: base body first (one extrude of the main outline, or one revolve for a turned part); then added material, **each new solid touching what comes before it** (a support right after the plate it stands on, before the barrel it carries and extends into); then removed material, a feature always after the one whose face it starts from; fillets and chamfers last.
 
-Frame: Z is up, the face the part rests on is at Z = 0, and the part is centred on X and Y about its main axis or symmetry centrelines. For a turned part, the axis of revolution is Z. Describe this in `frame`.
+Frame: the frame card from step 5 (`feature_tree.frame`). Every position, direction and profile is in it.
 
 **Merging features extend into what they join.** A support, pedestal, web, rib, gusset or boss that meets another body (a barrel, a wall, a curved face) does not stop where its edges become hidden, nor where they meet the other body's outline. Model it **into** that body: up to the body's axis or centre for a cylinder, up to the far face for a wall. The union removes the part inside, and the visible outline comes out right by itself. Its size then needs no guess. **When the body is round** (a barrel, a boss, a cylinder), set `extends_into` to that body's feature id and leave the height out: the harness computes it from the feature's `position` and `direction` up to the body's axis (a block standing on a plate top at Z = 9 under a barrel whose axis is at Z = 49 gets height 40). For that, give the round body a `position` on its axis and its `direction`. When the body is flat (a wall, a plate), give the height up to its far face yourself, with the dimensions that place that face as evidence. Either way, record the choice as an assumption that names this rule.
 
@@ -159,7 +181,7 @@ After the part is built, it is projected into every view of the drawing and chec
 Reply with one JSON object matching the output schema, and nothing else:
 
 - `overview`: the summary from step 1.
-- `feature_tree`: the frame, the features from step 5, the assumptions, and anything unsupported.
+- `feature_tree`: the frame card from step 5, the features from step 6, the assumptions, and anything unsupported.
 - `uncertainties`: conflicts between views, unreadable values, missing views, and anything you could not interpret.
 
 The view summaries are saved separately by the harness; do not repeat them.

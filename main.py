@@ -149,6 +149,7 @@ class Run:
     build_attempts: int = 0
     cross_check: dict | None = None  # conflicts between the view analyses and the arbiter's rulings
     scans: dict = field(default_factory=dict)  # scanned sheets: regions read by scan_view, by id (S1, S2, ...)
+    frame_issue: dict | None = None  # the frame card check of the last build (apply_frame)
     scanned: bool = False  # split_views found no vector content: the sheet is a scan
 
     def __post_init__(self):
@@ -1094,6 +1095,8 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
                         context["texts"] = drawing_texts(run)
                     if ctx.check and "corners" in ctx.check:
                         context["corners"] = ctx.check["corners"]
+                    if ctx.check and "previous_frame" in ctx.check:
+                        context["previous_frame"] = ctx.check["previous_frame"]
                     result = agent.output_model.model_validate(result, context=context).model_dump(mode="json")
             except (ValueError, ValidationError) as error:
                 problem = validation_problems(error)
@@ -1282,6 +1285,10 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
             "measured (often a small pictorial view, where hidden steps cannot be seen): treat it as a hint. "
             "If an issue contradicts a dimension you read from a section or an orthographic view, keep your value "
             "and say why in `uncertainties`; do not remove a feature the drawing dimensions.\n\n"
+            "**The frame card (`feature_tree.frame`) is frozen.** Fix features inside it; never flip, mirror or "
+            "re-orient one feature or one view to make it fit. Change the frame only for the whole part, when at "
+            "least two independent views (or the orientation check) show it is wrong, and record that in "
+            "`frame.revisions`; the harness rejects any other change to the card.\n\n"
             "## Issues to fix\n```json\n" + json.dumps(issues, indent=1, ensure_ascii=False) + "\n```\n\n"
             + ("## Orientation check\n```json\n" + json.dumps(pose, indent=1) + "\n```\n\n" if pose else "")
             + "## Your current plan\n```json\n" + json.dumps(current, indent=1, ensure_ascii=False) + "\n```\n\n"
@@ -1289,7 +1296,9 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
             + ("\n\n## Cross-check rulings (settled from the drawing; they override the summaries)\n```json\n"
                + json.dumps(plan_result["cross_check"].get("rulings", []), indent=1, ensure_ascii=False) + "\n```"
                if (plan_result.get("cross_check") or {}).get("rulings") else ""))
-    result = run_agent(agent, Ctx(run), [{"type": "text", "text": text}], label=f"main[revision {round_no}]")
+    previous = plan_result["feature_tree"].get("frame") or {}
+    result = run_agent(agent, Ctx(run, None, {"previous_frame": previous}), [{"type": "text", "text": text}],
+                       label=f"main[revision {round_no}]")
     return save_plan(run, {**result, "summaries": plan_result.get("summaries", []),
                            "cross_check": plan_result.get("cross_check")})
 
@@ -1327,9 +1336,68 @@ def build(run: Run, plan_result: dict, corrections: dict | None = None) -> dict:
         if f["state"] != "built":
             log.warning("  %s %s: %s", f["id"], f["state"], f["note"])
     log.info("build: %s, STEP %s", report["status"], step if step.is_file() else "not written")
+    run.frame_issue = None
     if step.is_file():
+        try:
+            run.frame_issue = apply_frame(run, tree.get("frame") or {})
+        except Exception as error:
+            log.warning("frame check skipped: %s", error)
         write_viewer(run)
     return report
+
+
+def apply_frame(run: Run, frame: dict) -> dict | None:
+    """The setup standard after a build: translate the model so the frame card's rules hold (resting face at z = 0
+    or the part centred on it; centred in X and Y on its symmetry centre or axis when the card says so) - a
+    translation only, never a rotation - and compare the built size along X, Y and Z with the card's expected
+    bounding box. Sizes on the wrong axes mean the part is laid out in another orientation than the card: that is
+    returned as a plan issue for the correction loop."""
+    import cadquery as cq
+    step = run.dir / "model.step"
+    shutil.copyfile(step, run.dir / "model_raw.step")
+    shape = cq.importers.importStep(str(step)).val()
+    bb = shape.BoundingBox()
+    dz = -bb.zmin if frame.get("z_origin", "resting_face") == "resting_face" else -(bb.zmin + bb.zmax) / 2
+    dx = dy = 0.0
+    if frame.get("origin_rule") == "symmetry_centre":
+        dx, dy = -(bb.xmin + bb.xmax) / 2, -(bb.ymin + bb.ymax) / 2
+    if max(abs(dx), abs(dy), abs(dz)) > 1e-3:
+        cq.exporters.export(cq.Workplane().add(shape.translate(cq.Vector(dx, dy, dz))), str(step))
+        log.info("frame: model translated by (%.2f, %.2f, %.2f) to the frame card's origin (no rotation)", dx, dy, dz)
+    run.trace("frame_normalise", translate=[dx, dy, dz], card={k: frame.get(k) for k in ("family", "origin_rule",
+                                                                                          "z_origin", "origin")})
+    expected = frame.get("expected_bbox_mm")
+    if not expected or len(expected) != 3:
+        return None
+    built = [bb.xlen, bb.ylen, bb.zlen]
+    close = lambda b, e: abs(b - e) <= max(2.0, 0.05 * e)
+    if all(close(b, e) for b, e in zip(built, expected)):
+        log.info("frame: built size %s matches the card's %s", [round(v, 1) for v in built], expected)
+        return None
+    axes = "XYZ"
+    same_sizes = all(close(b, e) for b, e in zip(sorted(built), sorted(expected)))
+    detail = ", ".join(f"{a} {b:.1f} (card {e:g})" for a, b, e in zip(axes, built, expected))
+    if same_sizes:
+        issue = {"kind": "wrong_orientation", "severity": "high", "owner": "plan", "feature": None,
+                 "description": f"The part has the right sizes on the wrong axes: {detail}. It is laid out in a "
+                                "different orientation than the frame card.",
+                 "drawing": f"frame card: expected size {expected} along X, Y, Z ({frame.get('bbox_evidence', '')})",
+                 "model": f"built size {[round(v, 1) for v in built]} along X, Y, Z",
+                 "fix": "Keep the frame card and lay the features out in it: sketch the base on XY from the view "
+                        "the card names, extrude along +Z, and check which drawn size goes on which axis.",
+                 "evidence": ["frame card bounding box check"], "basis": "frame card"}
+    elif max(abs(b - e) / e for b, e in zip(built, expected)) > 0.10:
+        issue = {"kind": "wrong_size", "severity": "high", "owner": "plan", "feature": None,
+                 "description": f"The built part's overall size differs from the frame card's: {detail}.",
+                 "drawing": f"frame card: expected size {expected} ({frame.get('bbox_evidence', '')})",
+                 "model": f"built size {[round(v, 1) for v in built]}",
+                 "fix": "Find which feature makes the part too large or too small along that axis.",
+                 "evidence": ["frame card bounding box check"], "basis": "frame card"}
+    else:
+        log.info("frame: built size %s close to the card's %s", [round(v, 1) for v in built], expected)
+        return None
+    log.warning("frame: %s", issue["description"])
+    return issue
 
 
 def write_viewer(run: Run):
@@ -1620,6 +1688,8 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
                 break
             check = validate(run, plan_result, round_no)
             issues = [i for r in check["reports"] for i in r["issues"]]
+            if getattr(run, "frame_issue", None):
+                issues.append(run.frame_issue)
             escalate(issues, sent_to)
             high = [i for i in issues if i["severity"] == "high"]
             covered = [m["drawn_covered"] for m in check["measured"]]
