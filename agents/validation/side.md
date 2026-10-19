@@ -73,6 +73,7 @@ When the input's `note` says **scanned view**, the drawing had no vector content
 
 # Method
 
+- **Judge against the frame card** (`frame` in the feature tree): it fixes how the part is set up (the resting face at z = 0, the origin, which axis each view looks along). Report differences of shape, size and position inside that frame. Do not ask to flip, mirror or re-orient one feature or one view; if the whole part seems laid out wrongly, say so as one issue about the frame, with the views that show it.
 - **Compare invariant features only**: the outline, faces, holes, slots, bends, steps. Never dimension lines, leaders, text or centre lines: they are annotations, not geometry.
 - **Write what would prove the model wrong before you judge it**: two or three conditions you can check on the images ("if the tab is on the left in the drawing and on the right in the model, the bend direction is wrong"). Check each one; record them in `notes`.
 - **Check mirroring**: a view mirrored left to right (first- against third-angle projection, a view drawn from the other side) looks almost right. Compare left/right order of distinctive features (a tab, a notch, a hole off-centre) before you call two views the same.
