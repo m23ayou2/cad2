@@ -1,7 +1,7 @@
 ---
 name: corner_check
 description: Checks each corner of an outline traced by image processing on a scanned view, from a close-up of it.
-model: openai/gpt-6-luna
+role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0
 max_turns: 2
 tools: []

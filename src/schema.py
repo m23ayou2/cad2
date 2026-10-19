@@ -518,6 +518,26 @@ class CornerCheck(Strict):
         return self
 
 
+class VisualDifference(Strict):
+    """One difference the vision model sees between a drawing view and the model from the same camera."""
+    where: str = Field(description="Where in the image, e.g. 'the tab on the right', 'along the bottom edge'")
+    drawn: str = Field(description="What the drawing shows there")
+    model: str = Field(description="What the model shows there")
+    kind: Literal["missing_material", "extra_material", "different_shape", "hole_differs", "different_place",
+                  "mirrored_or_turned", "other"]
+    size: Literal["small_detail", "feature", "whole_face", "large_part"] = Field(
+        description="How big the difference is compared with the part")
+    confidence: float = Field(ge=0, le=1)
+
+
+class VisualDiff(Strict):
+    """The vision model's description of one view: differences and agreements, no judgement."""
+    view: str
+    differences: list[VisualDifference] = Field(default_factory=list)
+    matches: list[str] = Field(default_factory=list, description="What clearly agrees between drawing and model")
+    notes: list[str] = Field(default_factory=list)
+
+
 class Objection(Strict):
     claim: str = Field(description="What is wrong with the model, in one sentence")
     evidence: str = Field(description="What the drawing shows against what the model shows, and in which view")
@@ -543,4 +563,5 @@ class RedTeamReport(Strict):
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
     FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport, PathReport, CornerCheck, RedTeamReport,
+    VisualDiff,
 )}

@@ -1,7 +1,7 @@
 ---
 name: section
 description: Analyses a section view (e.g. SECTION A-A), which reveals internal cavities, bores and wall thicknesses.
-model: openai/gpt-6-luna
+role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0.1
 max_turns: 8
 tools:

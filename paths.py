@@ -164,7 +164,7 @@ def main():
     run_dir = m.RUNS_DIR / f"paths-{case}-{datetime.now():%Y%m%d-%H%M%S}"
     run_dir.mkdir(parents=True)
     run = m.open_run(drawing, run_dir, args.max_cost)
-    run.trace("paths_start", drawing=str(drawing), model=m.MODEL)
+    run.trace("paths_start", drawing=str(drawing), model=m.VISION_MODEL)
     analyse_sheet(m, run, run_dir, args.max_regions, args.min_share, args.views, args.workers)
 
 

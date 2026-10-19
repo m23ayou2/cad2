@@ -1,7 +1,6 @@
 ---
 name: validation/section
 description: Compares the built model with a section view of the drawing and reports what matches and what must be fixed.
-model: openai/gpt-6-luna
 temperature: 0.1
 max_turns: 5
 tools:
@@ -65,6 +64,13 @@ When the input's `note` says **scanned view**, the drawing had no vector content
 - **Shaded renders.** When the `note` says the edges come from a **shaded render**, shading bands add edges that no model has: judge the outline and the main edges only, and do not report extra drawn edges inside the faces.
 - **Camera in doubt.** When the input has `camera_doubt`, another view of the same model fits it well and this one fits poorly from every camera tried, so this view is probably not one the check can project (an isometric from a non-standard camera, a flat blank of a bent part, a detail). Describe what differs, but judge the shape by eye against the drawing and do not let the low coverage alone make an issue high: the harness treats this view's issues as advisory.
 - Scanned edges are accurate to about a pixel (`scale_mm_per_px`); differences smaller than two pixels are noise.
+
+# When you get the vision inspector's list instead of images
+
+Validation may come in two steps: a vision model looked at the drawing view, the model from the same camera and their overlay, and listed what differs and what agrees (`What the vision inspector sees`). You then get no images: you judge from the **numbers** (coverage, silhouette overlap, separation, landmarks), the **feature tree** and that **list**.
+- **The numbers decide whether the view matches**; the list says where and how it does not. A difference the inspector reports with low confidence, or that the numbers do not support (a good silhouette overlap and coverage), is at most low severity.
+- **Map each difference to a feature**: which feature in the tree makes (or should make) that material, hole, tab or bend, and what to change. A difference no feature explains is a missing feature.
+- The inspector sees images only: it does not know the part's history or which feature is which. Trust its descriptions of *what* is visible, not its guesses of *why*.
 
 # Reading the check
 

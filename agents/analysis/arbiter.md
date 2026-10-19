@@ -1,7 +1,6 @@
 ---
 name: analysis/arbiter
 description: Settles disagreements and gaps between the view analyses, from the drawing itself, before the part is planned.
-model: openai/gpt-6-luna
 temperature: 0.1
 max_turns: 10
 tools:
