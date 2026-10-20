@@ -1,7 +1,7 @@
 ---
 name: section
 description: Analyses a section view (e.g. SECTION A-A), which reveals internal cavities, bores and wall thicknesses.
-model: openai/gpt-6-luna
+model: anthropic/claude-haiku-5.5
 temperature: 0.1
 max_turns: 8
 tools:

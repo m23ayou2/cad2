@@ -1,7 +1,7 @@
 ---
 name: front
 description: Analyses the front view of a drawing, the main elevation that gives widths and heights.
-model: openai/gpt-6-luna
+model: anthropic/claude-haiku-5.5
 temperature: 0.1
 max_turns: 6
 tools:

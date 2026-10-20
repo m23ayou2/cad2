@@ -1,7 +1,7 @@
 ---
 name: side
 description: Analyses a side view (left or right elevation) of a drawing, which gives depths and heights.
-model: openai/gpt-6-luna
+model: anthropic/claude-haiku-5.5
 temperature: 0.1
 max_turns: 6
 tools:

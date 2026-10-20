@@ -53,7 +53,7 @@ import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
-MODEL = "openai/gpt-6-luna"
+MODEL = "anthropic/claude-haiku-5.5"
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2

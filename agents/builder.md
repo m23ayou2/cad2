@@ -1,7 +1,7 @@
 ---
 name: builder
 description: Turns a feature tree into a CadQuery script and a STEP file, running and fixing it until it is one valid solid.
-model: openai/gpt-6-luna
+model: anthropic/claude-haiku-5.5
 temperature: 0.1
 max_turns: 12
 tools:

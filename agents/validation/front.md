@@ -1,7 +1,7 @@
 ---
 name: validation/front
 description: Compares the built model with the front view of the drawing and reports what matches and what must be fixed.
-model: openai/gpt-6-luna
+model: anthropic/claude-haiku-5.5
 temperature: 0.1
 max_turns: 5
 tools:
