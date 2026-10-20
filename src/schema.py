@@ -311,6 +311,8 @@ class Frame(Strict):
     axis: Literal["X", "Y", "Z"] | None = Field(None, description="Turned parts: the axis of revolution (Z unless "
                                                                   "the drawing forces another)")
     axis_reason: str = Field("", description="Why the axis is not Z, if it is not")
+    axis_isometric_view: str = Field("", description="Axis not Z only: the isometric view in which the part visibly "
+                                                     "lies on its side (its round faces seen as upright ellipses)")
     projection: Literal["first_angle", "third_angle", "unknown"] = "unknown"
     projection_evidence: str = Field("", description="The symbol, or the view layout and the isometric")
     views: list[FrameView] = Field(default_factory=list, description="Every orthographic view and section")
@@ -325,8 +327,11 @@ class Frame(Strict):
             raise ValueError("frame.expected_bbox_mm: three positive sizes, along X, Y and Z")
         if self.family == "turned" and self.axis is None:
             raise ValueError("frame.axis: a turned part needs its axis of revolution (Z by the setup standard)")
-        if self.axis not in (None, "Z") and not self.axis_reason:
-            raise ValueError(f"frame.axis is {self.axis}: say in axis_reason why the axis is not Z")
+        if self.axis not in (None, "Z") and (not self.axis_reason or not self.axis_isometric_view):
+            raise ValueError(f"frame.axis is {self.axis}: a turned part's axis is Z by the setup standard. Another "
+                             "axis needs axis_reason and axis_isometric_view: an isometric view in which the part "
+                             "visibly lies on its side. A section or end view drawn with the axis horizontal is the "
+                             "usual way to draw a turned part, not evidence: keep Z")
         # the card is frozen: a revision may change it only through a recorded revision
         previous = (info.context or {}).get("previous_frame")
         if previous:

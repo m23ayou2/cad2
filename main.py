@@ -57,7 +57,7 @@ import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 MODEL = "openai/gpt-6-luna" 
-MODEL = "nvidia/nemotron-3.5-super-vl" #"anthropic/claude-haiku-5.5" 
+MODEL = "anthropic/claude-haiku-5.5" 
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -1416,8 +1416,12 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
     t0 = time.monotonic()
     if scanned:
         scans_json = out_dir / "scans.json"
+        cameras = {c["view"]: {"look": schema.AXIS_VEC[c["looks_along"]], "up": schema.AXIS_VEC[c["image_up"]],
+                               "looks_along": c["looks_along"]}
+                   for c in (plan_result["feature_tree"].get("frame") or {}).get("views", [])}
         entries = ([{"id": v.id, "label": v.label, **v.scan, "px_per_mm": run.scans[v.id].get("scale_px_per_mm"),
-                     "folder": run.scans[v.id].get("folder")} for v in labelled] if labelled else
+                     "folder": run.scans[v.id].get("folder"),
+                     **({"card_camera": cameras[v.id]} if v.id in cameras else {})} for v in labelled] if labelled else
                    [{"id": v.id, "label": v.label, "kind": "auto", "direction": "none", "box": v.sheet_box,
                      "image": str(v.png), "folder": str(v.png.parent)} for v in scanned])
         scans_json.write_text(json.dumps(entries, indent=1), encoding="utf-8")
@@ -1438,7 +1442,9 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
     run.trace("projections", round=round_no, data=data)
 
     by_pdf = {v.pdf.stem: v for v in run.views.values() if v.pdf} | {v.id: v for v in scanned}
-    mark_unknown_cameras(data["views"], vlog)
+    if not (data.get("pose") or {}).get("better_orientation_found"):
+        # when the pose test finds the whole part turned, a failing isometric is evidence, not a doubtful camera
+        mark_unknown_cameras(data["views"], vlog)
     tree = plan_result["feature_tree"]
     compact = [{k: f.get(k) for k in ("id", "name", "op", "params", "on", "position", "direction", "pattern")}
                for f in tree["features"]]
@@ -1544,9 +1550,12 @@ def mark_unknown_cameras(entries: list[dict], vlog: logging.Logger, good: float 
     on an unlabelled scan a flat blank or a detail), so its mismatch is not evidence against the model. When no view
     fits, nothing is marked: then the model is what is wrong."""
     fits = lambda e, v: e["metrics"]["drawn_covered"] >= v and e["metrics"]["model_covered"] >= v
+    # a good fit only counts as proof of the model when its camera was not searched for it: from the frame card,
+    # or a search that clearly picked one camera (a free camera can hide a wrongly oriented part)
+    trusted = lambda e: e.get("camera_source") == "card" or (e.get("separation") or {}).get("decided", True)
     scanned = [e for e in entries if e.get("metrics") and str(e.get("note", "")).startswith("scanned view")]
     pool = scanned or [e for e in entries if e.get("class") == "isometric" and e.get("metrics")]
-    if not any(fits(e, good) for e in pool):
+    if not any(fits(e, good) and trusted(e) for e in pool):
         return
     for e in pool:
         if e["metrics"]["drawn_covered"] < poor or e["metrics"]["model_covered"] < poor:
@@ -1660,6 +1669,21 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
             issues = [i for r in check["reports"] for i in r["issues"]]
             if getattr(run, "frame_issue", None):
                 issues.append(run.frame_issue)
+            pose = check.get("pose") or {}
+            if pose.get("better_orientation_found"):
+                issues.append({
+                    "kind": "wrong_orientation", "severity": "high", "owner": "plan", "feature": None,
+                    "description": f"The whole part is oriented differently from the drawing: {pose['rotation_text']} "
+                                   f"and every view fits better (pose score {pose['card_pose_score']} -> "
+                                   f"{pose['best_pose_score']}, decided on all views together).",
+                    "drawing": f"views {', '.join(pose.get('supporting_views', []))}",
+                    "model": f"per view, card pose {pose['card_pose_per_view']}, better pose {pose['best_pose_per_view']}",
+                    "fix": f"Revise the frame card for the whole part: {pose['rotation_text']}. Record it in "
+                           f"frame.revisions with these views as evidence: {', '.join(pose.get('supporting_views', []))}. "
+                           "Then lay every feature out in the revised frame.",
+                    "evidence": ["joint pose test on all views"], "basis": "measured: joint pose test"})
+                log.warning("orientation: %s (pose score %s -> %s)", pose["rotation_text"], pose["card_pose_score"],
+                            pose["best_pose_score"])
             escalate(issues, sent_to)
             high = [i for i in issues if i["severity"] == "high"]
             covered = [m["drawn_covered"] for m in check["measured"]]
@@ -1769,6 +1793,10 @@ def red_team_review(run: Run, rounds: list[dict]) -> dict | None:
             if key in images and Path(images[key]).is_file():
                 content += [{"type": "text", "text": f"{e['view_id']} {key}:"},
                             image_part(Path(images[key]).read_bytes())]
+    pose = data.get("pose") or {}
+    content.append({"type": "text", "text": "Orientation check (the whole part scored in all 24 axis-aligned "
+                    "rotations against every view at once): " + json.dumps(pose, ensure_ascii=False) + ". Do not "
+                    "claim an orientation error this check does not support; say what you see instead."})
     tree = json.loads((run.dir / "feature_tree.json").read_text(encoding="utf-8"))
     content.append({"type": "text", "text": "Feature tree:\n```json\n" + json.dumps(
         {"frame": tree.get("frame"), "features": [{k: f.get(k) for k in ("id", "name", "op", "params", "position",
@@ -1779,6 +1807,10 @@ def red_team_review(run: Run, rounds: list[dict]) -> dict | None:
     except Exception as error:
         log.warning("red team review failed: %s", error)
         return None
+    for o in report["objections"]:
+        if o["kind"] in ("orientation", "mirrored") and "better_orientation_found" in pose:
+            o["pose_check"] = ("supported: " + pose.get("rotation_text", "") if pose["better_orientation_found"] else
+                               "not supported by the joint pose test: " + pose.get("verdict", ""))
     (run.dir / "red_team.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     for o in report["objections"]:
         log.warning("red team [%s/%s] %s: %s", o["severity"], o["kind"], o.get("feature") or "-", o["claim"])

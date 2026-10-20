@@ -293,7 +293,16 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
     if len(drawn_px) < 50:
         return {"unresolved": "too few part edges found in this scan"}, None, None
     candidates = []
-    if kind == "auto":
+    card = scan.get("card_camera")
+    if card and kind not in ("flat_pattern", "isometric"):
+        # the frame card fixes this view's camera: compare from exactly that camera. A free search would let a
+        # wrong orientation of the whole part pass by finding a camera that hides it
+        spec = {"look": tuple(card["look"]), "up": tuple(card["up"]), "turns": (0,), "given": True,
+                "source": "card"}
+        if kind == "section":
+            spec["cut_normal"] = tuple(-np.array(card["look"], float))
+        candidates.append((f"the frame card's camera (looking along {card.get('looks_along', card['look'])})", spec))
+    elif kind == "auto":
         # nobody said what this view is: every standard direction (turned on the sheet) and every isometric camera
         for name, cls in (("FRONT", "front"), ("REAR", "front"), ("TOP", "top"), ("BOTTOM", "top"),
                           ("LEFT", "side"), ("RIGHT", "side")):
@@ -412,6 +421,7 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
              "horizontal": vc.axis_name(basis[0]), "vertical": vc.axis_name(basis[1]),
              "looking_along": vc.axis_name(np.array(spec["look"], float)),
              "camera": caption, "scale_mm_per_px": round(scale, 5),
+             "camera_source": spec.get("source", "search"),
              **({"class": spec["class"]} if spec.get("class") else {}),
              "note": ("scanned view: part edges separated by image processing; scale "
                       + ("measured from the dimension values" if measured_scale and scan.get("px_per_mm") else
@@ -432,6 +442,97 @@ def check_view(shape, scan: dict, gray: np.ndarray, sheet_px_per_mm: float | Non
     return entry, aligned, model
 
 
+# --------------------------------------------------------------------------- one pose for the whole part
+def rotations() -> list[np.ndarray]:
+    """The 24 axis-aligned rotations of the part (proper rotations: no mirror)."""
+    import itertools
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            m = np.zeros((3, 3))
+            for i, (j, sg) in enumerate(zip(perm, signs)):
+                m[i, j] = sg
+            if np.linalg.det(m) > 0:
+                out.append(m)
+    return out
+
+
+def describe_rotation(r: np.ndarray) -> str:
+    names = ["+X", "+Y", "+Z"]
+    where = lambda v: ("+" if v[int(np.argmax(np.abs(v)))] > 0 else "-") + "XYZ"[int(np.argmax(np.abs(v)))]
+    moved = [f"{n} -> {where(r @ np.eye(3)[i])}" for i, n in enumerate(names) if where(r @ np.eye(3)[i]) != n]
+    return "turn the whole part so that " + ", ".join(moved)
+
+
+def joint_pose(shape, views: list[dict], budget_s: float) -> dict:
+    """The orientation of the whole part. The frame card fixes each orthographic view's camera relative to the
+    part, and the model is built in the card, so card and model turn together: the orthographic views only check
+    that the model follows the card (their own comparison above). What fixes the part's absolute orientation is the
+    isometric views, drawn by convention from a camera with Z up: the part is tried in each of the 24 axis-aligned
+    rotations (the card turning with it) and scored on the isometrics, each from the best of the four standard
+    isometric cameras. The card's pose stands unless another rotation is clearly better and better on every
+    isometric (GeoInt's robust camera check: no single view decides)."""
+    started = time.monotonic()
+    isos = [v for v in views if v["kind"] == "isometric"]
+    if not isos:
+        return {"verdict": "not checked: no isometric view fixes the absolute orientation",
+                "better_orientation_found": False}
+    memo = {}
+
+    def project(look, up):
+        key = (tuple(np.round(look, 4)), tuple(np.round(up, 4)))
+        if key not in memo:
+            try:
+                memo[key] = sample(ps.model_view_points(shape, {"look": tuple(look), "up": tuple(up)}), 4000)
+            except Exception:
+                memo[key] = np.zeros((0, 2))
+        return memo[key]
+
+    def view_score(v, look, up):
+        model = project(look, up)
+        if len(model) < 20:
+            return 0.0
+        best = 0.0
+        for f in (1.0, 1.15, 1.3, 1.5):
+            scale = f * extent(model) / max(extent(v["drawn"]), 1e-6)
+            tol = max(1.5 * scale, 0.005 * extent(model))
+            best = max(best, quick_fit(sample(v["drawn"], 1500) * scale, model, tol)[0] / 2)
+        return best
+
+    cams = [(np.array((sx, 1, sz)) / math.sqrt(3), np.array((0, 0, 1.0))) for sx in (-1, 1) for sz in (-1, 1)]
+    rows = []
+    for r in rotations():
+        if time.monotonic() - started > budget_s:
+            return {"verdict": "not checked: out of time", "better_orientation_found": False}
+        # the part turned by r, seen from the fixed standard cameras = the part seen from cameras turned by r^T
+        rows.append((r, {v["id"]: max(view_score(v, r.T @ lk, r.T @ up) for lk, up in cams) for v in isos}))
+    # a view whose score hardly changes whichever way the part is turned (a dark shaded underside, say) cannot tell
+    # orientations apart: it gets no vote. The others must all agree.
+    spread = {v["id"]: max(row[1][v["id"]] for row in rows) - min(row[1][v["id"]] for row in rows) for v in isos}
+    voters = [k for k, sp in spread.items() if sp >= 0.10] or list(spread)
+    mean = lambda per: float(np.mean([per[k] for k in voters]))
+    card_row = next(row for row in rows if np.allclose(row[0], np.eye(3)))
+    best_r, best = max(rows, key=lambda row: mean(row[1]))
+    gain = mean(best) - mean(card_row[1])
+    every = all(best[k] - card_row[1][k] >= 0.05 for k in voters)
+    found = (not np.allclose(best_r, np.eye(3))) and gain >= 0.10 and every
+    result = {"verdict": (describe_rotation(best_r) + ": the isometric views fit clearly better" if found else
+                          "the frame card's orientation fits the isometric views best" if np.allclose(best_r, np.eye(3))
+                          else "another orientation scores a little better, but not clearly or not on every "
+                               "isometric: the card stands"),
+              "better_orientation_found": bool(found),
+              "card_pose_score": round(mean(card_row[1]), 3), "best_pose_score": round(mean(best), 3),
+              "card_pose_per_view": {k: round(v, 3) for k, v in card_row[1].items()},
+              "best_pose_per_view": {k: round(v, 3) for k, v in best.items()},
+              "views_used": voters, "views_without_a_vote": [k for k in spread if k not in voters],
+              "seconds": round(time.monotonic() - started, 1)}
+    if found:
+        result["rotation"] = best_r.round().astype(int).tolist()
+        result["rotation_text"] = describe_rotation(best_r)
+        result["supporting_views"] = voters
+    return result
+
+
 def run(drawing: str, step: str, scans_json: str, out_dir: str) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     shape = ps.load_step(step)
@@ -441,6 +542,7 @@ def run(drawing: str, step: str, scans_json: str, out_dir: str) -> dict:
     out = {"step": step, "views": [], "scanned": True,
            "pose": {"verdict": "not checked on a scanned drawing", "better_orientation_found": False}}
     started = time.monotonic()
+    joint = []
     for s in scans:
         entry = {"view_id": s["id"], "class": s.get("kind"), "label": s.get("label") or s.get("kind")}
         out["views"].append(entry)
@@ -458,6 +560,11 @@ def run(drawing: str, step: str, scans_json: str, out_dir: str) -> dict:
             continue
         filled = result.pop("_images", {})
         entry.update(result)
+        if s.get("card_camera") or s.get("kind") == "isometric":
+            joint.append({"id": s["id"], "kind": s.get("kind"), "look": (s.get("card_camera") or {}).get("look"),
+                          "up": (s.get("card_camera") or {}).get("up"),
+                          "scale": (1 / s["px_per_mm"]) if s.get("px_per_mm") else None,
+                          "drawn": part_points(edges_and_annotations(gray, s.get("folder"))[0])})
         if drawn is None:
             continue
         # the validators see the filled images (faces in colour, silhouettes overlaid); the edge plots stay on disk
@@ -471,6 +578,10 @@ def run(drawing: str, step: str, scans_json: str, out_dir: str) -> dict:
         np.savez_compressed(stem + ".points.npz", drawing=drawn, model=model)
         entry["points"] = stem + ".points.npz"
         entry["callouts"] = []
+    # the orientation of the whole part, judged on all views at once from the frame card's cameras
+    if joint:
+        remaining = max(30.0, TIME_BUDGET_S + 120 - (time.monotonic() - started))
+        out["pose"] = joint_pose(shape, joint, remaining)
     with open(os.path.join(out_dir, "validation.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1, ensure_ascii=False)
     return out
