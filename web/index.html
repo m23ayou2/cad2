@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draw2CAD</title>
+<link rel="stylesheet" href="/vendor/daisyui.css">
+<link rel="stylesheet" href="/vendor/daisyui-themes.css">
+<script src="/vendor/tailwind-browser.js"></script>
+<script>
+  // follow the system light / dark setting
+  const mq = matchMedia("(prefers-color-scheme: dark)");
+  const setTheme = () => document.documentElement.dataset.theme = mq.matches ? "dark" : "light";
+  setTheme(); mq.addEventListener("change", setTheme);
+</script>
+<style>
+  html, body { height: 100%; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  .hidden { display: none !important; }
+  .muted { color: color-mix(in oklab, var(--color-base-content) 55%, transparent); }
+  .faint { color: color-mix(in oklab, var(--color-base-content) 38%, transparent); }
+
+  /* composer */
+  .composer { border: 1px solid var(--color-base-300); background: var(--color-base-100); border-radius: 1.25rem;
+              box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 6px 24px rgba(0,0,0,.06); transition: border-color .15s, box-shadow .15s; }
+  .composer:focus-within { border-color: color-mix(in oklab, var(--color-primary) 55%, var(--color-base-300)); }
+  .composer.drag { border-color: var(--color-primary); box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-primary) 18%, transparent); }
+  .composer textarea { width: 100%; resize: none; background: transparent; outline: none; border: 0; font-size: 1rem;
+                       line-height: 1.5; max-height: 40vh; padding: 0; }
+  .file-card { display: inline-flex; align-items: center; gap: .6rem; padding: .45rem .7rem; border-radius: .75rem;
+               background: var(--color-base-200); border: 1px solid var(--color-base-300); max-width: 100%; }
+  .file-card .ic { width: 2rem; height: 2rem; border-radius: .5rem; display: grid; place-items: center; flex: none;
+                   background: color-mix(in oklab, var(--color-error) 16%, transparent); color: var(--color-error); }
+  .file-card .nm { font-size: .875rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-menu { width: 18rem; }
+  .model-menu li > button { display: grid; grid-template-columns: 1fr auto; gap: 0 .5rem; text-align: left; }
+  .model-menu .note { grid-column: 1; font-size: .75rem; }
+
+  /* thread */
+  .thread { overflow-y: auto; scroll-behavior: smooth; }
+  .col { width: min(48rem, 100%); margin: 0 auto; padding: 0 1rem; }
+  .split .col { width: 100%; }
+  .bubble-user { background: var(--color-base-200); border-radius: 1.25rem; padding: .7rem 1rem; max-width: 85%;
+                 margin-left: auto; white-space: pre-wrap; word-wrap: break-word; }
+  .prose-sm p { margin: 0 0 .6rem; } .prose-sm ul { margin: 0 0 .6rem 1.2rem; list-style: disc; }
+  .prose-sm code { background: var(--color-base-200); padding: 0 .3rem; border-radius: .3rem; font-size: .85em; }
+  .avatar-logo { width: 1.75rem; height: 1.75rem; flex: none; }
+  .appear { animation: appear .35s ease-out both; }
+  @keyframes appear { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* activity, Claude style */
+  .act-head { display: inline-flex; align-items: center; gap: .55rem; padding: .3rem .1rem; cursor: pointer;
+              border-radius: .5rem; user-select: none; }
+  .act-head:hover .chev { opacity: 1; }
+  .act-head .chev { opacity: .5; transition: transform .25s, opacity .15s; }
+  .act.open .act-head .chev { transform: rotate(180deg); }
+  .shimmer { background: linear-gradient(90deg,
+               color-mix(in oklab, var(--color-base-content) 45%, transparent) 0%,
+               var(--color-base-content) 45%, color-mix(in oklab, var(--color-base-content) 45%, transparent) 90%);
+             background-size: 250% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+             animation: shimmer 2.2s linear infinite; }
+  @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -150% 0; } }
+  .grow-box { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .3s ease; }
+  .grow-box > div { overflow: hidden; }
+  .open > .grow-box { grid-template-rows: 1fr; }
+  .tl { position: relative; margin: .4rem 0 .2rem .55rem; padding-left: 1.3rem; border-left: 1.5px solid var(--color-base-300); }
+  .tl-item { position: relative; padding: .28rem 0; }
+  .tl-item.enter { animation: slidein .4s ease-out both; }
+  @keyframes slidein { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+  .tl-dot { position: absolute; left: calc(-1.3rem - 7.5px); top: .55rem; width: 14px; height: 14px; border-radius: 50%;
+            background: var(--color-base-100); display: grid; place-items: center; }
+  .tl-dot.done::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: color-mix(in oklab, var(--color-base-content) 35%, transparent); }
+  .tl-dot.failed::after, .tl-dot.stopped::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--color-error); }
+  .tl-row { display: flex; gap: .6rem; align-items: baseline; cursor: pointer; font-size: .9rem; }
+  .tl-row .t { flex: 1; } .tl-item.done .t { color: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+  .tl-item.failed .t { color: var(--color-error); }
+  .tl-row .m { font-size: .75rem; white-space: nowrap; }
+  .tl-details { font-size: .8rem; padding: .15rem 0 .3rem; }
+  .tl-details div { padding: .1rem 0; }
+  .rawlog pre { max-height: 18rem; overflow: auto; font-size: .72rem; white-space: pre-wrap; word-break: break-word; }
+
+  /* layout: the 3D panel slides in when the part is done */
+  #layout { display: flex; min-height: 0; height: 100%; }
+  #chatpane { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+  #viewpane { flex: 0 0 0; width: 0; overflow: hidden; transition: flex-basis .55s cubic-bezier(.2,.8,.2,1); position: relative; }
+  .split #viewpane { flex-basis: 56%; }
+  .viewcard { position: absolute; inset: .75rem .75rem .75rem 0; border-radius: 1.25rem; overflow: hidden;
+              background: var(--color-base-200); border: 1px solid var(--color-base-300); }
+  #view { position: absolute; inset: 0; }
+  .viewcard .tabs { box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .proj-img { background: #fff; border-radius: .6rem; border: 1px solid var(--color-base-300); width: 100%;
+              display: block; cursor: zoom-in; }
+  .card .proj-fig, .proj-fig { display: block; margin: 0; }
+  .proj-fig figcaption { font-size: .72rem; margin-bottom: .25rem; }
+  .legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 2px; margin: 0 .25rem -.05rem 0; }
+  #view canvas { display: block; width: 100% !important; height: 100% !important; }
+  @media (max-width: 900px) {
+    #layout { flex-direction: column; }
+    .split #viewpane { flex-basis: 45vh; }
+    #viewpane { transition: none; } .viewcard { inset: 0 .75rem .75rem; }
+  }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three.module.js", "three/addons/controls/OrbitControls.js": "/vendor/OrbitControls.js" } }
+</script>
+</head>
+<body class="bg-base-100 text-base-content">
+
+<!-- icons -->
+<svg width="0" height="0" class="absolute">
+  <symbol id="i-logo" viewBox="0 0 32 32"><path d="M16 3 28 10v12L16 29 4 22V10z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M4 10l12 7 12-7M16 17v12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M16 3 28 10 16 17 4 10z" fill="currentColor" opacity=".22"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24"><path d="m21.4 11.6-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+  <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 3v12m0 0-5-5m5 5 5-5M5 21h14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></symbol>
+</svg>
+
+<!-- ============================================================ home -->
+<main id="home" class="hidden h-full overflow-y-auto">
+  <div class="min-h-full flex flex-col items-center justify-center px-4 py-12">
+    <div class="w-full max-w-2xl">
+      <div class="flex items-center justify-center gap-3 mb-8">
+        <svg class="w-10 h-10 text-primary"><use href="#i-logo"/></svg>
+        <h1 class="text-3xl md:text-4xl font-semibold tracking-tight">What are we building?</h1>
+      </div>
+      <div class="composer p-3 pl-4" id="homebox"></div>
+      <p class="text-center text-xs faint mt-3">Attach a PDF drawing. The part comes back as a STEP file you can open in your CAD software.</p>
+      <div id="recent" class="hidden mt-12">
+        <div class="text-xs font-medium uppercase tracking-wider faint mb-2 px-1">Recent drawings</div>
+        <ul id="recentlist" class="menu w-full p-0 gap-0.5"></ul>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ============================================================ session -->
+<div id="session" class="hidden h-full flex flex-col">
+  <header class="flex items-center gap-3 px-4 h-14 border-b border-base-300 flex-none">
+    <a href="#/" class="flex items-center gap-2 font-semibold"><svg class="w-6 h-6 text-primary"><use href="#i-logo"/></svg>Draw2CAD</a>
+    <span class="faint">/</span>
+    <span id="title" class="truncate text-sm"></span>
+    <span id="status" class="badge badge-sm"></span>
+    <span class="flex-1"></span>
+    <button id="stop" class="btn btn-ghost btn-sm hidden"><svg class="w-3.5 h-3.5"><use href="#i-stop"/></svg>Stop</button>
+    <a href="#/" class="btn btn-sm"><svg class="w-4 h-4"><use href="#i-plus"/></svg>New drawing</a>
+  </header>
+  <div id="layout" class="flex-1">
+    <section id="chatpane">
+      <div id="thread" class="thread flex-1 pt-6 pb-4"></div>
+      <div id="chatwrap" class="hidden flex-none pb-4">
+        <div class="col"><div class="composer p-3 pl-4" id="chatbox"></div></div>
+      </div>
+    </section>
+    <section id="viewpane">
+      <div class="viewcard flex flex-col">
+        <div class="flex flex-wrap items-center gap-2 p-3 flex-none relative z-10">
+          <div role="tablist" class="tabs tabs-box tabs-sm bg-base-100/90">
+            <button role="tab" class="tab tab-active" data-tab="model">3D model</button>
+            <button role="tab" class="tab" data-tab="proj">Projections</button>
+          </div>
+          <span class="flex-1"></span>
+          <div id="tools-model" class="flex gap-2">
+            <button id="reset" class="btn btn-sm btn-ghost bg-base-100/90"><svg class="w-4 h-4"><use href="#i-reset"/></svg>Reset view</button>
+            <a id="download" class="btn btn-sm btn-primary"><svg class="w-4 h-4"><use href="#i-dl"/></svg>Download STEP</a>
+          </div>
+          <div id="tools-proj" class="hidden flex flex-wrap items-center gap-2">
+            <div class="join">
+              <button class="btn btn-sm join-item btn-active" data-mode="side">Side by side</button>
+              <button class="btn btn-sm join-item" data-mode="overlay">Overlay</button>
+            </div>
+            <button id="runproj" class="btn btn-sm btn-primary">Run projections</button>
+          </div>
+        </div>
+        <div class="relative flex-1 min-h-0">
+          <div id="pane-model" class="absolute inset-0">
+            <div id="view"></div>
+            <div id="modelinfo" class="badge badge-lg bg-base-100/90 border-base-300 h-auto py-1.5 absolute left-3 bottom-3"></div>
+          </div>
+          <div id="pane-proj" class="absolute inset-0 overflow-y-auto px-3 pb-3 hidden"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<dialog id="imgdialog" class="modal">
+  <div class="modal-box max-w-6xl w-11/12 p-4">
+    <div class="flex items-center gap-2 mb-3"><b id="imgtitle"></b><span class="flex-1"></span>
+      <form method="dialog"><button class="btn btn-sm btn-ghost btn-circle"><svg class="w-4 h-4"><use href="#i-x"/></svg></button></form></div>
+    <div id="imgbody"></div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const icon = (name, cls = "w-4 h-4") => `<svg class="${cls}"><use href="#i-${name}"/></svg>`;
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || r.statusText);
+  return d;
+}
+const FINISHED = ["done", "failed", "stopped", "interrupted"];
+const STATUS = { queued: ["Waiting", "badge-ghost"], running: ["Working", "badge-info"], done: ["Done", "badge-success"],
+                 failed: ["Failed", "badge-error"], stopped: ["Stopped", "badge-warning"], interrupted: ["Interrupted", "badge-error"] };
+let MODELS = [], DEFAULT = "";
+const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+
+function dur(s) {
+  if (s == null) return "";
+  s = Math.round(s);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+const money = (c) => c == null ? "" : c < 0.01 ? `$${c.toFixed(4)}` : `$${c.toFixed(3)}`;
+function autosize(t) { t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * 0.4) + "px"; }
+function md(text) {  // small safe subset: paragraphs, lists, **bold**, `code`
+  const inline = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
+  const item = /^\s*(?:[-*•]|\d+[.)]) /;
+  return text.trim().split(/\n{2,}/).map((block) => {
+    let html = "", para = [], list = [];
+    const flush = () => {
+      if (para.length) html += `<p>${para.map(inline).join("<br>")}</p>`;
+      if (list.length) html += "<ul>" + list.map((l) => `<li>${inline(l.replace(item, ""))}</li>`).join("") + "</ul>";
+      para = []; list = [];
+    };
+    for (const line of block.split("\n")) {
+      if (item.test(line)) { if (para.length) flush(); list.push(line); } else { if (list.length) flush(); para.push(line); }
+    }
+    flush();
+    return html;
+  }).join("");
+}
+
+// ================================================================== composer (home and chat)
+function composer(box, { placeholder, attach, onSend, storeKey, dropUp }) {
+  box.innerHTML = `
+    <div class="files flex flex-wrap gap-2 empty:hidden mb-2"></div>
+    <textarea rows="1" placeholder="${esc(placeholder)}"></textarea>
+    <div class="flex items-center gap-1 mt-2">
+      ${attach ? `<button class="attach btn btn-ghost btn-sm btn-circle tooltip tooltip-bottom" data-tip="Attach a PDF drawing">${icon("clip", "w-[18px] h-[18px]")}</button>
+                  <input type="file" accept="application/pdf,.pdf" hidden>` : ""}
+      <span class="flex-1"></span>
+      <div class="dropdown dropdown-end ${dropUp ? "dropdown-top" : ""}">
+        <div tabindex="0" role="button" class="btn btn-ghost btn-sm font-normal gap-1"><span class="mname"></span>${icon("down", "w-3.5 h-3.5 opacity-60")}</div>
+        <ul tabindex="0" class="dropdown-content menu model-menu bg-base-100 rounded-box border border-base-300 shadow-lg z-50 p-1.5 my-1"></ul>
+      </div>
+      <button class="send btn btn-primary btn-sm btn-circle" disabled>${icon("up")}</button>
+    </div>`;
+  const ta = box.querySelector("textarea"), send = box.querySelector(".send"), files = box.querySelector(".files");
+  const menu = box.querySelector(".model-menu"), mname = box.querySelector(".mname");
+  const st = { file: null, model: store.get(storeKey) || DEFAULT };
+  if (!MODELS.some((m) => m.id === st.model)) st.model = DEFAULT;
+  const ready = () => send.disabled = attach ? !st.file : !ta.value.trim();
+  function drawMenu() {
+    const cur = MODELS.find((m) => m.id === st.model);
+    mname.textContent = cur ? cur.name : st.model;
+    menu.innerHTML = MODELS.map((m) => `<li><button data-id="${esc(m.id)}" class="${m.id === st.model ? "menu-active" : ""}">
+        <span class="font-medium">${esc(m.name)}</span>${m.id === st.model ? icon("check", "w-4 h-4 row-span-2 self-center") : "<span></span>"}
+        <span class="note muted">${esc(m.note)}</span></button></li>`).join("");
+    for (const b of menu.querySelectorAll("button")) b.onclick = () => {
+      st.model = b.dataset.id; store.set(storeKey, st.model); drawMenu(); document.activeElement?.blur();
+    };
+  }
+  drawMenu();
+  function setFile(f) {
+    if (f && !/\.pdf$/i.test(f.name) && f.type !== "application/pdf") { alert(`${f.name} is not a PDF drawing.`); return; }
+    st.file = f || null;
+    files.innerHTML = st.file ? `<div class="file-card appear"><span class="ic">${icon("file", "w-4 h-4")}</span>
+      <div class="min-w-0"><div class="nm"></div><div class="text-xs muted">PDF · ${(st.file.size / 1024).toFixed(0)} KB</div></div>
+      <button class="btn btn-ghost btn-xs btn-circle ml-1">${icon("x", "w-3.5 h-3.5")}</button></div>` : "";
+    if (st.file) {
+      files.querySelector(".nm").textContent = st.file.name;
+      files.querySelector("button").onclick = () => setFile(null);
+    }
+    ready(); ta.focus();
+  }
+  if (attach) {
+    const input = box.querySelector("input[type=file]");
+    box.querySelector(".attach").onclick = () => input.click();
+    input.onchange = () => { setFile(input.files[0]); input.value = ""; };
+  }
+  ta.addEventListener("input", () => { autosize(ta); ready(); });
+  ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!send.disabled) go(); } });
+  send.onclick = go;
+  async function go() {
+    send.disabled = true;
+    const ok = await onSend({ text: ta.value.trim(), file: st.file, model: st.model });
+    if (ok) { ta.value = ""; autosize(ta); setFile(null); } else ready();
+  }
+  return { setFile, focus: () => ta.focus(), setBusy: (b) => { ta.disabled = b; if (b) send.disabled = true; else ready(); } };
+}
+
+// ================================================================== routing
+function route() {
+  const m = location.hash.match(/^#\/job\/([\w-]+)(\/projections)?/);
+  if (!m) return openHome();
+  if (m[1] === S.id) { setTab(m[2] ? "proj" : "model"); return; }   // same job: only the tab changed
+  S.wantTab = m[2] ? "proj" : "model";
+  openSession(m[1]);
+}
+addEventListener("hashchange", route);
+
+// ================================================================== home
+let home;
+async function openHome() {
+  stopPolling();
+  $("session").classList.add("hidden"); $("home").classList.remove("hidden");
+  home.focus();
+  try {
+    const jobs = await api("/api/jobs");
+    $("recent").classList.toggle("hidden", !jobs.length);
+    $("recentlist").innerHTML = jobs.slice(0, 6).map((j) => {
+      const [label, cls] = STATUS[j.status] || [j.status, ""];
+      return `<li><a href="#/job/${esc(j.id)}" class="flex items-center gap-3 py-2.5">
+        <span class="text-error/80">${icon("file")}</span><span class="truncate flex-1">${esc(j.name)}</span>
+        <span class="badge badge-sm ${cls}">${j.status === "running" ? '<span class="loading loading-spinner loading-xs"></span>' : ""}${label}</span>
+        <span class="text-xs faint w-28 text-right">${esc(j.created.replace("T", " ").slice(5, 16))}</span></a></li>`;
+    }).join("");
+  } catch {}
+}
+document.addEventListener("dragover", (e) => { e.preventDefault(); if (!$("home").classList.contains("hidden")) $("homebox").classList.add("drag"); });
+document.addEventListener("dragleave", (e) => { if (!e.relatedTarget) $("homebox").classList.remove("drag"); });
+document.addEventListener("drop", (e) => {
+  e.preventDefault(); $("homebox").classList.remove("drag");
+  if (!$("home").classList.contains("hidden") && e.dataTransfer.files[0]) home.setFile(e.dataTransfer.files[0]);
+});
+
+async function startJob({ text, file, model }) {
+  if (!file) return false;
+  try {
+    const job = await api("/api/jobs", { method: "POST", body: file, headers: {
+      "X-Filename": encodeURIComponent(file.name), "X-Prompt": encodeURIComponent(text), "X-Model": model } });
+    location.hash = `#/job/${job.id}`;
+    return true;
+  } catch (err) { alert(err.message); return false; }
+}
+
+// ================================================================== session
+const S = {};
+let chat;
+function stopPolling() { clearTimeout(S.timer); S.timer = null; }
+
+async function openSession(id) {
+  stopPolling();
+  Object.assign(S, { id, job: null, timer: null, actOpen: false, openSteps: new Set(), logOffset: 0, log: "",
+                     finished: false, rawOpen: false });
+  $("home").classList.add("hidden"); $("session").classList.remove("hidden");
+  $("thread").innerHTML = ""; $("chatwrap").classList.add("hidden");
+  $("layout").classList.remove("split");
+  clearModel();
+  setTab("model");
+  Object.assign(P, { loaded: false, set: null, data: null, timer: clearTimeout(P.timer) });
+  await tick(true);
+}
+
+async function tick(first) {
+  const id = S.id;
+  try {
+    const [st, lg] = await Promise.all([api(`/api/jobs/${id}/steps`), api(`/api/jobs/${id}/log?offset=${S.logOffset}`)]);
+    if (id !== S.id) return;
+    S.log += lg.text; S.logOffset = lg.offset; S.job = st.job;
+    render(st);
+    if (FINISHED.includes(st.job.status) && !S.finished) await finish(first);
+  } catch (err) { console.warn(err); }
+  if (id === S.id && !FINISHED.includes(S.job?.status)) S.timer = setTimeout(() => tick(false), 1200);
+}
+
+function render(st) {
+  const j = st.job;
+  $("title").textContent = j.name;
+  const [label, cls] = STATUS[j.status] || [j.status, ""];
+  $("status").className = `badge badge-sm ${cls}`;
+  $("status").innerHTML = (j.status === "running" ? '<span class="loading loading-spinner loading-xs"></span>' : "") + label;
+  $("stop").classList.toggle("hidden", !["running", "queued"].includes(j.status));
+  const thread = $("thread");
+  const nearBottom = thread.scrollTop + thread.clientHeight >= thread.scrollHeight - 60;
+
+  if (!thread.querySelector(".u-first")) {
+    S.actOpen = !FINISHED.includes(j.status);   // open while it works, so the steps can be watched
+    const model = MODELS.find((m) => m.id === j.model);
+    thread.insertAdjacentHTML("beforeend", `
+      <div class="col u-first mb-6 appear flex flex-col items-end gap-2">
+        <a class="file-card" href="/api/jobs/${esc(j.id)}/drawing" target="_blank"><span class="ic">${icon("file")}</span>
+          <div class="min-w-0"><div class="nm">${esc(j.name)}</div><div class="text-xs muted">PDF drawing</div></div></a>
+        ${j.prompt ? `<div class="bubble-user">${esc(j.prompt)}</div>` : ""}
+      </div>
+      <div class="col bot mb-4 flex gap-3 appear">
+        <svg class="avatar-logo text-primary mt-1"><use href="#i-logo"/></svg>
+        <div class="flex-1 min-w-0">
+          <div class="act"><div class="act-head"></div><div class="grow-box"><div><div class="tl"></div>
+            <details class="rawlog mt-1 mb-2"><summary class="text-xs faint cursor-pointer">Raw log</summary><pre class="bg-base-200 rounded-box p-3 mt-1"></pre></details></div></div></div>
+          <div class="summary prose-sm mt-2"></div>
+          <div class="text-xs faint mt-1 modelline">${esc(model ? model.name : j.model || "")}</div>
+        </div>
+      </div>
+      <div class="chatlog"></div>`);
+    const act = thread.querySelector(".act");
+    act.querySelector(".act-head").onclick = () => { S.actOpen = !S.actOpen; act.classList.toggle("open", S.actOpen); };
+    const raw = act.querySelector(".rawlog");
+    raw.addEventListener("toggle", () => { S.rawOpen = raw.open; });
+  }
+
+  // the moving header line
+  const act = thread.querySelector(".act");
+  act.classList.toggle("open", S.actOpen);
+  const steps = st.steps, n = steps.length;
+  const current = [...steps].reverse().find((s) => s.status === "running");
+  let head;
+  if (j.status === "queued") {
+    head = `<span class="loading loading-dots loading-sm opacity-70"></span><span class="shimmer font-medium">Waiting for a free slot</span>`;
+  } else if (j.status === "running") {
+    const what = current ? current.title : (n ? "Thinking" : "Starting");
+    head = `<span class="loading loading-spinner loading-sm text-primary"></span><span class="shimmer font-medium">${esc(what)}…</span>
+            <span class="text-sm faint">${dur(st.seconds)}</span>`;
+  } else {
+    const verb = j.status === "done" ? "Worked for" : "Stopped after";
+    head = `<span class="${j.status === "done" ? "text-success" : "text-error"}">${icon(j.status === "done" ? "check" : "x")}</span>
+            <span class="muted">${verb} ${dur(st.seconds)} · ${n} step${n === 1 ? "" : "s"}${j.cost_usd != null ? " · " + money(j.cost_usd) : ""}</span>`;
+  }
+  act.querySelector(".act-head").innerHTML = head + icon("down", "chev w-4 h-4");
+
+  // the timeline: update rows in place, slide new ones in
+  const tl = act.querySelector(".tl");
+  steps.forEach((s, i) => {
+    let el = tl.children[i];
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "tl-item enter";
+      el.innerHTML = `<span class="tl-dot"></span><div class="tl-row"><span class="t"></span><span class="m faint"></span></div>
+                      <div class="grow-box"><div><div class="tl-details muted"></div></div></div>`;
+      el.querySelector(".tl-row").onclick = () => {
+        S.openSteps.has(i) ? S.openSteps.delete(i) : S.openSteps.add(i);
+        el.classList.toggle("open", S.openSteps.has(i));
+      };
+      tl.appendChild(el);
+    }
+    el.classList.remove("running", "done", "failed", "stopped");
+    el.classList.add(s.status);
+    el.classList.toggle("open", S.openSteps.has(i));
+    const dot = el.querySelector(".tl-dot");
+    dot.className = `tl-dot ${s.status}`;
+    dot.innerHTML = s.status === "running" ? '<span class="loading loading-spinner text-primary" style="width:12px"></span>' : "";
+    el.querySelector(".t").textContent = s.title;
+    el.querySelector(".t").classList.toggle("shimmer", s.status === "running");
+    el.querySelector(".m").textContent = [dur(s.seconds), s.cost ? money(s.cost) : ""].filter(Boolean).join(" · ");
+    el.querySelector(".tl-details").innerHTML = s.details.length ? s.details.map((d) => `<div>${esc(d)}</div>`).join("") : "<div>Working…</div>";
+  });
+  const pre = act.querySelector(".rawlog pre");
+  if (pre.textContent.length !== S.log.length) { pre.textContent = S.log || "(empty)"; pre.scrollTop = pre.scrollHeight; }
+  act.querySelector(".rawlog").open = S.rawOpen;
+  if (nearBottom) thread.scrollTop = thread.scrollHeight;
+}
+
+$("stop").onclick = async () => {
+  if (!confirm("Stop this drawing? What it has done so far is kept.")) return;
+  try { await api(`/api/jobs/${S.id}/stop`, { method: "POST" }); } catch (err) { alert(err.message); }
+};
+
+// ------------------------------------------------------------------ finished
+async function typeOut(el, text, instant) {
+  if (instant) { el.innerHTML = md(text); return; }
+  const words = text.split(/(\s+)/);
+  for (let i = 1; i <= words.length; i += 2) {
+    el.innerHTML = md(words.slice(0, i).join(""));
+    $("thread").scrollTop = $("thread").scrollHeight;
+    await new Promise((r) => setTimeout(r, 18));
+  }
+  el.innerHTML = md(text);
+}
+
+async function finish(instant) {
+  S.finished = true;
+  S.actOpen = false;
+  $("thread").querySelector(".act")?.classList.remove("open");
+  const j = S.job;
+  if (j.has_step) {
+    $("layout").classList.add("split");
+    setTimeout(() => { resize(); loadModel(); if (S.wantTab === "proj") setTab("proj"); }, instant ? 0 : 560);
+  }
+  await typeOut($("thread").querySelector(".summary"), summaryText(j), instant);
+  if (j.run_dir) {
+    $("chatwrap").classList.remove("hidden");
+    let history = [];
+    try { history = await api(`/api/jobs/${S.id}/chat`); } catch {}
+    for (const m of history) addMsg(m.role, m.content, true);
+    chat.focus();
+  }
+  $("thread").scrollTop = $("thread").scrollHeight;
+}
+
+function summaryText(j) {
+  const r = j.result;
+  if (!r) return j.status === "stopped" ? "Stopped. Everything done so far is kept in the steps above."
+                                        : "The run ended without a result. Open the steps above, then **Raw log**, to see why.";
+  const out = [];
+  if (r.status === "built") out.push("**The part is built.**");
+  else if (r.status === "partial") out.push("**The part is built, but not every feature could be made.**");
+  else out.push("**No valid part could be built.** The steps above show where it stopped.");
+  if (r.validated) {
+    const cov = r.drawn_covered != null ? ` and covers ${(r.drawn_covered * 100).toFixed(0)}% of what the drawing shows` : "";
+    out.push(`It was checked against the drawing's views${cov}` + (r.high_issues_left
+      ? `, with ${r.high_issues_left} serious issue(s) left: check those features before use.` : ", with no serious issue left."));
+  } else if (r.status !== "failed") {
+    out.push("It could not be measured against the drawing: check it by eye before use.");
+  }
+  out.push(`It took ${dur(r.seconds)} and cost ${money(r.cost_usd || 0)}.`);
+  if (j.has_step) out.push("The model is on the right. Ask me anything about it below.");
+  return out.join("\n\n");
+}
+
+function addMsg(role, text, instant) {
+  const log = $("thread").querySelector(".chatlog");
+  const el = document.createElement("div");
+  el.className = "col mb-5 appear";
+  if (role === "user") el.innerHTML = `<div class="bubble-user"></div>`, el.firstChild.textContent = text;
+  else el.innerHTML = `<div class="flex gap-3"><svg class="avatar-logo text-primary mt-0.5"><use href="#i-logo"/></svg>
+                       <div class="body prose-sm flex-1 min-w-0">${text == null ? '<span class="loading loading-dots loading-sm opacity-60"></span>' : md(text)}</div></div>`;
+  log.appendChild(el);
+  $("thread").scrollTop = $("thread").scrollHeight;
+  return el;
+}
+
+async function sendChat({ text, model }) {
+  if (!text) return false;
+  addMsg("user", text);
+  const pending = addMsg("assistant", null);
+  chat.setBusy(true);
+  try {
+    const history = await api(`/api/jobs/${S.id}/chat`, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                         body: JSON.stringify({ message: text, model }) });
+    await typeOut(pending.querySelector(".body"), history[history.length - 1].content);
+  } catch (err) { pending.querySelector(".body").textContent = `Could not answer: ${err.message}`; }
+  chat.setBusy(false); chat.focus();
+  return true;
+}
+
+// ------------------------------------------------------------------ projections
+const P = { mode: store.get("d2c-proj-mode") || "side", loaded: false, set: null, timer: null, data: null };
+for (const b of document.querySelectorAll("[data-tab]")) b.onclick = () => {
+  location.hash = `#/job/${S.id}` + (b.dataset.tab === "proj" ? "/projections" : "");
+};
+function setTab(tab) {
+  for (const b of document.querySelectorAll("[data-tab]")) b.classList.toggle("tab-active", b.dataset.tab === tab);
+  $("pane-model").classList.toggle("hidden", tab !== "model");
+  $("tools-model").classList.toggle("hidden", tab !== "model");
+  $("pane-proj").classList.toggle("hidden", tab !== "proj");
+  $("tools-proj").classList.toggle("hidden", tab !== "proj");
+  if (tab === "proj" && !P.loaded && S.id) loadProjections();
+  if (tab === "model") resize();
+}
+for (const b of document.querySelectorAll("[data-mode]")) b.onclick = () => {
+  P.mode = b.dataset.mode; store.set("d2c-proj-mode", P.mode); drawProjections();
+};
+
+async function loadProjections(set) {
+  const id = S.id;
+  clearTimeout(P.timer);
+  if (!P.data) $("pane-proj").innerHTML = '<div class="grid place-items-center h-40 muted"><span class="loading loading-spinner"></span></div>';
+  try {
+    const d = await api(`/api/jobs/${id}/projections${set ? `?set=${encodeURIComponent(set)}` : ""}`);
+    if (id !== S.id) return;
+    P.data = d; P.loaded = true; P.set = d.set;
+    drawProjections();
+    if (d.running) P.timer = setTimeout(() => loadProjections(), 2000);
+  } catch (err) { $("pane-proj").innerHTML = `<div class="alert alert-error mt-2">${esc(err.message)}</div>`; }
+}
+
+$("runproj").onclick = async () => {
+  try {
+    P.data = await api(`/api/jobs/${S.id}/projections`, { method: "POST" });
+    drawProjections();
+    P.timer = setTimeout(() => loadProjections(), 2000);
+  } catch (err) { alert(err.message); }
+};
+
+const pct = (x) => x == null ? "–" : `${Math.round(x * 100)}%`;
+const level = (x) => x == null ? "badge-ghost" : x >= 0.95 ? "badge-success" : x >= 0.8 ? "badge-warning" : "badge-error";
+const SET_NAME = (s) => s.startsWith("validation/round_") ? `Pipeline check, round ${s.split("_").pop()}`
+                      : `Your projection, ${s.split("/").pop().replace(/^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)$/, "$4:$5")}`;
+
+function drawProjections() {
+  const d = P.data, pane = $("pane-proj");
+  for (const b of document.querySelectorAll("[data-mode]")) b.classList.toggle("btn-active", b.dataset.mode === P.mode);
+  const run = $("runproj");
+  run.disabled = !d || !d.available || d.running;
+  run.innerHTML = d?.running ? '<span class="loading loading-spinner loading-xs"></span>Projecting…' : "Run projections";
+  if (!d) return;
+  let head = "";
+  if (!d.available) head += `<div class="alert alert-info alert-soft mb-3">Projections compare the model with the drawing's views, which needs a vector PDF. This drawing is a scan, so it cannot be projected yet.</div>`;
+  if (d.error) head += `<div class="alert alert-error alert-soft mb-3">${esc(d.error)}</div>`;
+  if (d.running && !d.views.length) head += `<div class="alert alert-soft mb-3"><span class="loading loading-spinner loading-sm"></span>Projecting the model into every view of the drawing…</div>`;
+  if (d.sets.length) {
+    head += `<div class="flex flex-wrap items-center gap-2 mb-3">
+      <select class="select select-sm w-auto" id="projset">${d.sets.map((s) => `<option value="${esc(s)}" ${s === d.set ? "selected" : ""}>${esc(SET_NAME(s))}</option>`).join("")}</select>
+      ${d.matches_model ? '<span class="badge badge-success badge-soft badge-sm">Current model</span>' : '<span class="badge badge-warning badge-soft badge-sm">An earlier model</span>'}
+      ${d.running ? '<span class="badge badge-sm"><span class="loading loading-spinner loading-xs"></span>projecting</span>' : ""}
+      <span class="flex-1"></span>
+      ${P.mode === "overlay" ? `<span class="legend text-xs muted"><i style="background:#000"></i>drawing <i style="background:#e33"></i>model <i style="background:orange"></i>drawn, missing in model <i style="background:#a3c"></i>in model, not drawn</span>` : ""}
+    </div>`;
+  } else if (d.available && !d.running) {
+    head += `<div class="text-center muted py-10">No projections yet. <b>Run projections</b> compares the model with every view of the drawing.</div>`;
+  }
+  pane.innerHTML = head + `<div class="grid gap-3">${d.views.map(viewCard).join("")}</div>`;
+  pane.querySelector("#projset")?.addEventListener("change", (e) => loadProjections(e.target.value));
+  for (const img of pane.querySelectorAll(".proj-img")) img.onclick = () => zoom(img.dataset.title, img.src);
+}
+
+function viewCard(v) {
+  const m = v.metrics || {}, ax = v.axes || {};
+  const axes = ax.looking_along ? `looking along ${ax.looking_along} · right ${ax.horizontal} · up ${ax.vertical}` : "";
+  const fig = (key, cap) => v.images[key] ? `<figure class="proj-fig"><figcaption class="muted">${cap}</figcaption>
+      <img class="proj-img" loading="lazy" src="${esc(v.images[key])}" data-title="${esc(v.label)}: ${cap}"></figure>` : "";
+  let body;
+  if (!Object.keys(v.images).length) body = `<div class="text-sm muted">Not compared: ${esc(v.note || "this view could not be projected")}</div>`;
+  else if (P.mode === "overlay") body = fig("overlay", "Drawing and model on top of each other");
+  else body = `<div class="grid grid-cols-2 gap-2 items-start">${fig("drawing", "Drawing")}${fig("model", "Model projection")}</div>`;
+  const callouts = v.callouts.map((c) => `<span class="badge badge-sm badge-soft ${c.ok ? "badge-success" : "badge-error"} tooltip" data-tip="${esc(c.detail || "")}">${c.ok ? "✓" : "✗"} ${esc(c.text)}</span>`).join(" ");
+  return `<div class="card bg-base-100 border border-base-300 appear"><div class="card-body p-3 gap-2">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="font-semibold">${esc(v.label)}</span><span class="text-xs faint">${esc(axes)}</span><span class="flex-1"></span>
+      <span class="badge badge-sm badge-soft ${level(m.drawn_covered)} tooltip" data-tip="Share of the drawn lines the model matches">drawing matched ${pct(m.drawn_covered)}</span>
+      <span class="badge badge-sm badge-soft ${level(m.model_covered)} tooltip" data-tip="Share of the model's lines that are on the drawing">model on drawing ${pct(m.model_covered)}</span>
+      ${m.drawn_to_model_p95_mm != null ? `<span class="badge badge-sm badge-ghost tooltip" data-tip="95% of drawn lines are this close to the model">within ${m.drawn_to_model_p95_mm} mm</span>` : ""}
+      ${v.missing ? `<span class="badge badge-sm badge-warning badge-soft">${v.missing} missing area(s)</span>` : ""}
+      ${v.extra ? `<span class="badge badge-sm badge-warning badge-soft">${v.extra} extra area(s)</span>` : ""}
+    </div>
+    ${body}
+    ${callouts ? `<div class="flex flex-wrap gap-1 items-center"><span class="text-xs muted mr-1">Dimensions:</span>${callouts}</div>` : ""}
+  </div></div>`;
+}
+
+function zoom(title, src) {
+  $("imgtitle").textContent = title;
+  $("imgbody").innerHTML = `<img class="proj-img" style="cursor:default" src="${esc(src)}">`;
+  $("imgdialog").showModal();
+}
+
+// ------------------------------------------------------------------ 3D view
+const view = $("view");
+let renderer = null;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(devicePixelRatio);
+  view.appendChild(renderer.domElement);
+} catch {
+  view.innerHTML = '<div class="absolute inset-0 grid place-items-center p-6 text-center muted">This browser cannot show 3D (WebGL is off). Download the STEP to open the part in your CAD software.</div>';
+}
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100000);
+camera.up.set(0, 0, 1);
+const controls = renderer ? new OrbitControls(camera, renderer.domElement) : { update() {}, target: new THREE.Vector3() };
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8090a0, 1.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+scene.add(sun);
+let part = null;
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  if (!renderer || !w || !h) return;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view);
+(function loop() { if (!renderer) return; controls.update(); sun.position.copy(camera.position); renderer.render(scene, camera); requestAnimationFrame(loop); })();
+
+function clearModel() {
+  if (part) { scene.remove(part); part = null; }
+  $("modelinfo").innerHTML = '<span class="loading loading-spinner loading-xs"></span> Loading the model';
+}
+async function loadModel() {
+  const id = S.id;
+  try {
+    const r = await api(`/api/jobs/${id}/model`);
+    if (id !== S.id || !r.key) return;
+    showMesh(r.mesh);
+    const s = r.mesh.size.map((v) => +v.toFixed(1)).join(" × ");
+    $("modelinfo").innerHTML = `<span class="font-medium">${esc(r.label)}</span><span class="muted">· ${s} mm · ${Math.round(r.mesh.volume).toLocaleString()} mm³</span>`;
+    $("download").href = `/api/jobs/${id}/step`;
+  } catch (err) { $("modelinfo").textContent = `Could not load the model: ${err.message}`; }
+}
+function showMesh(mesh) {
+  if (part) scene.remove(part);
+  part = new THREE.Group();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(mesh.positions, 3));
+  geo.setIndex(mesh.indices);
+  geo.computeVertexNormals();
+  const color = getComputedStyle(document.documentElement).getPropertyValue("--color-primary").trim();
+  const mat = new THREE.MeshStandardMaterial({ color: 0x7c9cc9, metalness: 0.1, roughness: 0.6, polygonOffset: true, polygonOffsetFactor: 1 });
+  part.add(new THREE.Mesh(geo, mat));
+  const lines = new THREE.LineBasicMaterial({ color: 0x1f2633 });
+  for (const e of mesh.edges) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(e, 3));
+    part.add(new THREE.Line(g, lines));
+  }
+  scene.add(part);
+  fit();
+}
+function fit() {
+  if (!part) return;
+  const box = new THREE.Box3().setFromObject(part);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length() || 1;
+  controls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(1, -1.3, 0.9).normalize().multiplyScalar(size * 1.55));
+  camera.near = size / 1000; camera.far = size * 100; camera.updateProjectionMatrix();
+}
+$("reset").onclick = fit;
+
+// ================================================================== boot
+try { const info = await api("/api/info"); MODELS = info.models; DEFAULT = info.default; } catch {}
+home = composer($("homebox"), { placeholder: "Describe the part, or just attach its drawing…", attach: true,
+                                onSend: startJob, storeKey: "d2c-model" });
+chat = composer($("chatbox"), { placeholder: "Ask about the part: sizes, holes, what was checked…", attach: false,
+                                onSend: sendChat, storeKey: "d2c-chat-model", dropUp: true });
+route();
+</script>
+</body>
+</html>
