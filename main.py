@@ -3,9 +3,16 @@
     uv run python main.py cases/tier2/03/drawing.pdf [--view] [-v]
     uv run python main.py --build runs/<run>          # rebuild the STEP from an existing plan
 
-The main agent (agents/main.md) reads the sheet, splits it into views with
-src/split.py, calls one analysis agent (agents/analysis/<type>.md) per view, and
-returns a feature tree. The builder agent (agents/builder.md) turns the tree into
+The drawing is read first by the parts pipeline (src/part_views.py, the default,
+PLAN_METHOD = "parts"): each view is cropped, a vision model places points where
+edges meet, joins them with edges and splits the object into coloured parts, and
+the matching agent (src/agent/matcher.py) groups the parts that are the same
+physical part across views (saved in parts/). The main agent (agents/main.md)
+plans the feature tree from those groups, taking exact sizes, blank outlines and
+bend lines from the measuring tools (scan_view, set_dimension_values,
+trace_outline on scans; the text layer on vector sheets). With D2C_PLAN=subagents it instead
+splits the sheet with src/split.py and calls one analysis agent
+(agents/analysis/<type>.md) per view. The builder agent (agents/builder.md) turns the tree into
 a CadQuery script, runs it in its own process, and fixes it until it is one valid
 solid. src/validate.py then projects the model into every view of the drawing,
 and one validation agent per view (agents/validation/<type>.md) reports what
@@ -56,12 +63,10 @@ import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
-# MODEL = "openai/gpt-6-luna"
 MODEL = "anthropic/claude-haiku-5.5"   # one model for everything: looking at images and reasoning
-# Agents marked `role: vision` in their YAML run on VISION_MODEL, the rest on MODEL. Both are the same model for
-# now (no separate vision model); set VISION_MODEL to another id to split them again.
-VISION_MODEL = MODEL
-SPLIT_VALIDATION = False   # validation in two steps: the vision model describes, the reasoning model judges
+# How the drawing is read before planning: "parts" = the parts pipeline (views -> points -> edges -> parts ->
+# groups matched across views, src/part_views.py); "subagents" = split_views + one analysis subagent per view.
+PLAN_METHOD = os.getenv("D2C_PLAN", "parts")
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -84,12 +89,8 @@ class Agent:
     prompt: str
 
     @property
-    def role(self) -> str:
-        return "vision" if self.settings.get("role") == "vision" else "reasoning"
-
-    @property
     def model(self) -> str:
-        return VISION_MODEL if self.role == "vision" else MODEL
+        return MODEL
 
     @property
     def tools(self) -> list[str]:
@@ -1081,8 +1082,8 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
     messages: list[dict] = [{"role": "system", "content": agent.system_prompt}, {"role": "user", "content": content}]
     max_turns = int(agent.settings.get("max_turns", 10))
     started, agent_cost = time.monotonic(), 0.0
-    alog.info("started on %s (%s, %d tools, max %d turns)", agent.model, agent.role, len(tools), max_turns)
-    run.trace("agent_start", agent=label, tools=agent.tools, model=agent.model, role=agent.role)
+    alog.info("started on %s (%d tools, max %d turns)", agent.model, len(tools), max_turns)
+    run.trace("agent_start", agent=label, tools=agent.tools, model=agent.model)
 
     used: set[str] = set()
     stopped = False
@@ -1198,6 +1199,10 @@ def missing_steps(agent: Agent, run: Run, used: set[str]) -> list[str]:
     required = list(agent.settings.get("required_tools") or [])
     if run.scanned:
         required += agent.settings.get("required_tools_scanned") or []
+    if any((s.get("blank") or {}).get("corners") for s in run.scans.values()):
+        # a traced flat blank: its profile and bend lines must come from trace_outline (which also needs the
+        # blank's scale, set_dimension_values with scale_from), never from the raw trace or by eye
+        required.append("trace_outline")
     return [t for t in required if t in agent.tools and t not in used]
 
 
@@ -1322,10 +1327,121 @@ def save_plan(run: Run, result: dict) -> dict:
 
 
 def plan(run: Run) -> dict:
-    """Main agent + view subagents -> feature tree (feature_tree.json, plan.json)."""
+    """Feature tree (feature_tree.json, plan.json), from the parts pipeline or from the view subagents."""
+    if PLAN_METHOD == "parts":
+        return plan_from_parts(run)
     content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}. Start with step 1."}]
     result = run_agent(load_agent("main"), Ctx(run), content)
     return save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check})
+
+
+PARTS_BRIEF = """# The views are already read
+
+The views of this drawing were already read by the **parts pipeline** (src/part_views.py, src/agent/matcher.py):
+each view was found on the sheet and cropped; a vision model placed points where the object's edges meet,
+joined them with edges, and split the object in each view into coloured parts (P1, P2, ... numbered across
+all views); a matching agent then grouped the labels that are the same physical part of the object into
+groups (G1, G2, ...). One group = one physical part (a flange, a tab, a hole, a bend ...) with every label
+it has in every view, and the dimensions printed on the drawing that belong to it.
+
+The groups tell you **what** the part is made of and which region of one view is which region of another.
+They replace the view analyses: `split_views` and `call_subagent` are not available. They do **not** give exact
+sizes: the polygons below are rough outlines from a vision model (PDF points of each cropped view, 1 pt = 1/72
+inch, the view's own top-left origin, y down). Never take a size, a blank outline or a bend line from them.
+
+Exact geometry comes from the measuring tools:
+- Do step 1 (`view_drawing`, `read_drawing_text`).
+- **On a scanned sheet, follow the "Scanned sheets" part of step 2 for the measurements**: `scan_view` on every
+  view (use the view boxes below, `sheet_box_fraction`, widened to take in all its dimensions), then
+  `set_dimension_values`, and for a sheet-metal blank `trace_outline` on its copy without dimensions. The blank
+  `profile`, the `bend_lines`, the hole centres and every size come from these tools, never from the polygons.
+- A sheet-metal blank, in this order: `scan_view` both copies of the blank (kind flat_pattern);
+  `set_dimension_values` on the dimensioned copy; `set_dimension_values(scan=<copy without dimensions>,
+  scale_from=<dimensioned copy>)`; then `trace_outline` on the copy without dimensions. Its `profile` is the
+  `base_flange` profile and its blank's `bend_lines` are the bend lines, in mm, as they are. **Never rescale,
+  halve or shift a traced value yourself**: a size that looks wrong (twice the dimensioned overall, say) means
+  the scale was not set on that scan; set it with `scale_from` and call again.
+- On a vector sheet, read sizes with `read_drawing_text` and zoom with `view_drawing`.
+
+Then plan the part:
+- Every group must end up in the feature tree (one or more features), or in `uncertainties` with the reason.
+  Use the groups to decide the operations and their order: which flat panel becomes which formed face, which
+  panel stays flat, which holes are where, which way each bend goes. On a sheet-metal part, check each group's
+  flat panel against `scan_view`'s panels (P1, P2, ... and `bend_lines_join`) and faces (F1, F2, ...), and put
+  every bend on a measured bend line.
+- The matching is automatic and can be wrong: hole counts or diameters that disagree inside a group, or a
+  part that only one view shows, are hints to look again. When the drawing or a measurement contradicts a
+  group, follow the drawing and write it in `uncertainties`.
+- `frame.views` lists the views by the ids the measuring tools gave them (S1, S2, ... for scans), or by the ids
+  below (v1, v2, ...) when you scanned none.
+
+## Views
+```json
+{views}
+```
+
+## Matched groups
+```json
+{groups}
+```
+
+## Parts per view (polygons in the view's points)
+```json
+{parts}
+```
+
+The images follow: every view coloured by group (same colour = same group in every view), then each view
+alone with its group labels."""
+
+
+def plan_from_parts(run: Run) -> dict:
+    """Parts pipeline (views -> points -> edges -> parts -> matched groups, saved in parts/), then the main agent
+    plans the feature tree from the groups, measuring exact sizes with the sheet, its text and the scan tools."""
+    import src.part_views as part_views  # noqa: E402  (imported here: it needs ROOT, not src/, on the path)
+    import src.llm
+    src.llm.MODEL = MODEL
+    parts_dir = run.dir / "parts"
+    log.info("parts pipeline: views -> points -> edges -> parts -> matching, with %s", MODEL)
+    part_views.run(run.drawing, run_dir=parts_dir)
+    calls = [json.loads(line) for line in (parts_dir / "trace.jsonl").read_text().splitlines()]
+    run.cost_usd += sum(c.get("cost") or 0 for c in calls)
+    run.cost_unknown_calls += sum(1 for c in calls if c.get("cost") is None)
+    run.trace("parts_pipeline", calls=len(calls), cost_usd=sum(c.get("cost") or 0 for c in calls))
+
+    views = json.loads((parts_dir / "views.json").read_text())
+    groups = json.loads((parts_dir / "matches.json").read_text())["groups"]
+    with pymupdf.open(run.drawing) as doc:
+        run.scanned = not any(page.get_text("words") for page in doc)
+        sizes = {i + 1: (p.rect.width, p.rect.height) for i, p in enumerate(doc)}
+    listing, parts = [], {}
+    for v in views:
+        w, h = sizes[v["sheet"]]
+        x0, y0, x1, y1 = v["rect_pt"]
+        listing.append({"id": v["id"], "name": v["name"], "kind": v["kind"], "sheet": v["sheet"],
+                        "sheet_box_fraction": [round(x0 / w, 3), round(y0 / h, 3), round(x1 / w, 3), round(y1 / h, 3)],
+                        "size_pt": [round(x1 - x0, 1), round(y1 - y0, 1)]})
+        parts[v["id"]] = [{"label": p["id"], "name": p.get("name"), "feature": p.get("feature"),
+                           "dimensions": p.get("dimensions", []), "hidden": p.get("hidden", False),
+                           "outline_pt": [[round(x, 1), round(y, 1)] for x, y in p["polygon_pt"]],
+                           "holes_pt": [[[round(x, 1), round(y, 1)] for x, y in hole] for hole in p.get("holes_pt", [])],
+                           "notes": p.get("notes", "")} for p in v["parts"]]
+    text = PARTS_BRIEF.format(views=json.dumps(listing, indent=1, ensure_ascii=False),
+                              groups=json.dumps(groups, indent=1, ensure_ascii=False),
+                              parts=json.dumps(parts, ensure_ascii=False))
+    content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}.\n\n{text}"},
+               {"type": "text", "text": "All views, coloured by group:"},
+               image_part((parts_dir / "matched_all.png").read_bytes())]
+    for v in views:
+        content += [{"type": "text", "text": f"View {v['id']} ({v['name']}), coloured by group:"},
+                    image_part((parts_dir / "views" / f"{v['id']}_matched.png").read_bytes())]
+    agent = load_agent("main")
+    # the groups replace split_views and the view subagents; the measuring tools stay, and on a scan they are
+    # still required before the final answer (required_tools_scanned in agents/main.md)
+    agent.settings = {**agent.settings, "required_tools": [],
+                      "tools": ["view_drawing", "read_drawing_text", "scan_view", "set_dimension_values",
+                                "trace_outline"]}
+    result = run_agent(agent, Ctx(run), content, label="main[parts]")
+    return save_plan(run, {**result, "summaries": [], "cross_check": None, "parts": "parts/matches.json"})
 
 
 def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | None, round_no: int) -> dict:
@@ -1577,24 +1693,6 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
             text + "\n\n## Images shown\n" + "\n".join(f"- {caption} `{Path(entry['images'][key]).name}`"
                                                        for key, caption in captions if key in entry["images"]),
             encoding="utf-8")
-        if SPLIT_VALIDATION:
-            # step 1, the vision model: what differs between the images (no tree, no judgement)
-            look = [{"type": "text", "text": f"View: {view.id} (label on the sheet: {view.label}), a {kind} view. "
-                                             f"{frame}"}] + content[1:]
-            try:
-                seen = run_agent(load_agent("validation/look"), Ctx(run, view, entry), look,
-                                 label=f"validation/look[{view.id}]")
-                (out_dir / f"{view.id}.look.json").write_text(json.dumps(seen, indent=2, ensure_ascii=False),
-                                                             encoding="utf-8")
-                vlog.info("%s: the vision model sees %d difference(s), %d match(es)", view.id,
-                          len(seen["differences"]), len(seen["matches"]))
-                # step 2, the reasoning model: the numbers, the tree and what was seen; no images
-                content = [{"type": "text", "text": text + "\n\n## What the vision inspector sees\nAnother model "
-                            "looked at the drawing view, the model from the same camera and their overlay (you do "
-                            "not get the images). It describes; you judge, using the numbers above and the tree:\n"
-                            "```json\n" + json.dumps(seen, indent=1, ensure_ascii=False) + "\n```"}]
-            except Exception as error:
-                vlog.warning("%s: vision look failed (%s); validating with the images in one step", view.id, error)
         try:
             report = run_agent(load_agent(f"validation/{kind}"), Ctx(run, view, entry), content,
                                label=f"validation/{kind}[{view.id}]")
@@ -1814,9 +1912,8 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
         run_dir = RUNS_DIR / f"{drawing.parent.parent.name}-{drawing.parent.name}-{stamp}"
         run_dir.mkdir(parents=True)
         run = open_run(drawing, run_dir, max_cost)
-        run.trace("run_start", drawing=str(drawing), model=MODEL, vision_model=VISION_MODEL,
-                  split_validation=SPLIT_VALIDATION)
-    log.info("run %s: %s with %s (reasoning) and %s (vision)", run.dir.name, drawing, MODEL, VISION_MODEL)
+        run.trace("run_start", drawing=str(drawing), model=MODEL, plan_method=PLAN_METHOD)
+    log.info("run %s: %s with %s", run.dir.name, drawing, MODEL)
     if paths and not rebuild:  # the region-by-region analysis (paths.py), saved in this run's paths/ folder
         import paths as path_analysis
         try:
@@ -1905,8 +2002,7 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
     final = min(rounds, key=round_rank) if rounds else None
     out = run.dir / "result.json"
     out.write_text(json.dumps({
-        "drawing": str(drawing), "model": MODEL, "vision_model": VISION_MODEL, "split_validation": SPLIT_VALIDATION,
-        "status": final["build"] if final else report["status"],
+        "drawing": str(drawing), "model": MODEL, "plan_method": PLAN_METHOD, "status": final["build"] if final else report["status"],
         "validated": bool(final and final["measured_views"]),  # judged by eye only does not count
         "measured_views": final["measured_views"] if final else 0,
         "drawn_covered": final["drawn_covered"] if final else None,

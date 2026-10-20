@@ -2,7 +2,6 @@
 name: isometric
 reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses the isometric (pictorial) view to describe the overall shape; it is never used for dimensions.
-role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0.1
 max_turns: 4
 tools:

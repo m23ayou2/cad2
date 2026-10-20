@@ -2,7 +2,6 @@
 name: corner_check
 reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Checks each corner of an outline traced by image processing on a scanned view, from a close-up of it.
-role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0
 max_turns: 2
 tools: []

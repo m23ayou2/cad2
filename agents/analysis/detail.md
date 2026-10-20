@@ -2,7 +2,6 @@
 name: detail
 reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses a detail view (e.g. DETAIL B), an enlarged region that defines small features.
-role: vision      # runs on VISION_MODEL (main.py)
 temperature: 0.1
 max_turns: 6
 tools:
