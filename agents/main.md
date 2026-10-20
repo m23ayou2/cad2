@@ -1,5 +1,6 @@
 ---
 name: main
+reasoning: medium   # off | low | medium | high (main.py reasoning_setting)
 description: Reads an engineering drawing view by view and builds the feature tree of the part.
 model: openai/gpt-6-luna
 temperature: 0.2

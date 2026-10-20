@@ -57,7 +57,7 @@ import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 MODEL = "openai/gpt-6-luna" 
-MODEL = "anthropic/claude-haiku-5.5" 
+MODEL = "anthropic/claude-haiku-5.5"   # skipped for now, for both images and reasoning
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -597,21 +597,7 @@ def scan_view(ctx: Ctx, x0: SheetFraction, y0: SheetFraction, x1: SheetFraction,
         tip = tuple(int(v) for v in l["tip_px"])
         cv2.circle(over, tip, 4, (0, 150, 0), 2)
         cv2.putText(over, l["id"], (tip[0] + 5, tip[1] + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 150, 0), 1)
-    crops = []
-    for d in dims:
-        x0b, y0b, x1b, y1b = d["text_box_px"] or [int(min(d["from_px"][0], d["to_px"][0])),
-                                                  int(min(d["from_px"][1], d["to_px"][1])) - 20,
-                                                  int(max(d["from_px"][0], d["to_px"][0])),
-                                                  int(max(d["from_px"][1], d["to_px"][1])) + 20]
-        pad = 6
-        crop = gray[max(0, y0b - pad):y1b + pad, max(0, x0b - pad):x1b + pad]
-        if crop.size == 0:
-            continue
-        crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        tile = np.full((crop.shape[0] + 28, max(crop.shape[1], 120)), 255, np.uint8)
-        tile[28:, :crop.shape[1]] = crop
-        cv2.putText(tile, d["id"], (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 0, 2)
-        crops.append(tile)
+    crops = [t for t in (value_tile(gray, d) for d in dims) if t is not None]
     images = [(f"Scan {scan_id}: part black, dimension lines red with their ids, leader arrow tips green (L1, ...), "
                f"holes orange, outline blue" + (", the blank's bend lines magenta (B1, ...)" if flat_blank else ""),
                cv2.imencode(".png", over)[1].tobytes())]
@@ -633,7 +619,9 @@ def scan_view(ctx: Ctx, x0: SheetFraction, y0: SheetFraction, x1: SheetFraction,
                        f"{len(flat_blank['corners'])}, in order round the outline, for trace_outline",
                        cv2.imencode(".png", img)[1].tobytes()))
     if crops:
-        images.append((f"Scan {scan_id}: the value text of each dimension, enlarged (rotated text stays rotated)",
+        images.append((f"Scan {scan_id}: the value text of each dimension, enlarged (rotated text stays rotated). "
+                       "Where a tile shows several values, read the one written on the red line: that is the "
+                       "dimension's own line",
                        cv2.imencode(".png", crop_grid(crops))[1].tobytes()))
     log.info("scan %s: %d dimension(s), %d leader(s), %d hole(s), outline closed: %s", scan_id, len(dims),
              len(result["leaders"]), len(shape.get("holes", [])), shape.get("closed"))
@@ -711,6 +699,38 @@ def check_corners(run: Run, scan_id: str, gray: np.ndarray, flat_blank: dict):
                                                          indent=1, ensure_ascii=False), encoding="utf-8")
 
 
+def line_crop(d: dict, across: int = 30) -> list[int]:
+    """The box around a dimension line and its two sides (`across` px each way, across the line): where its value
+    text is when image processing found none, or to show the line with its neighbours when a value is in doubt."""
+    xs, ys = (d["from_px"][0], d["to_px"][0]), (d["from_px"][1], d["to_px"][1])
+    vertical = abs(xs[0] - xs[1]) < abs(ys[0] - ys[1])
+    ax, ay = (across, 4) if vertical else (4, across)
+    return [int(min(xs)) - ax, int(min(ys)) - ay, int(max(xs)) + ax, int(max(ys)) + ay]
+
+
+def value_tile(gray: np.ndarray, d: dict, wide: bool = False, zoom: int = 4) -> np.ndarray | None:
+    """One dimension's value, enlarged, with its id above: its text box when image processing found one, else (or
+    with `wide`, for a re-read) the band around its line, with the line itself drawn in red so that, among the
+    neighbouring values the band also shows, it is clear which one is this dimension's."""
+    marked = wide or not d["text_box_px"]
+    x0, y0, x1, y1 = line_crop(d, 45) if wide else (d["text_box_px"] or line_crop(d))
+    pad = 6
+    x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+    crop = cv2.cvtColor(gray[y0:y1 + pad, x0:x1 + pad], cv2.COLOR_GRAY2BGR)
+    if crop.size == 0:
+        return None
+    crop = cv2.resize(crop, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC)
+    if marked:
+        p = tuple(int((v - o) * zoom) for v, o in zip(d["from_px"], (x0, y0)))
+        q = tuple(int((v - o) * zoom) for v, o in zip(d["to_px"], (x0, y0)))
+        cv2.line(crop, p, q, (0, 0, 230), 3, cv2.LINE_AA)
+    tile = np.full((crop.shape[0] + 28, max(crop.shape[1], 120), 3), 255, np.uint8)
+    tile[28:, :crop.shape[1]] = crop
+    cv2.putText(tile, d["id"] + (" (red line)" if marked else ""), (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 0, 0), 2)
+    return tile
+
+
 def crop_grid(crops: list, max_width: int = 2400) -> np.ndarray:
     """Labelled crops in rows, as many per row as fit in max_width, so the sheet stays a sensible size however
     many dimensions a scan finds (one column of 50 crops would be taller than a model accepts)."""
@@ -726,10 +746,12 @@ def crop_grid(crops: list, max_width: int = 2400) -> np.ndarray:
     lines = []
     for r in rows:
         height = max(c.shape[0] for c in r)
-        cells = [np.pad(c, ((0, height - c.shape[0]), (0, 12)), constant_values=255) for c in r]
+        cells = [np.pad(c, ((0, height - c.shape[0]), (0, 12)) + ((0, 0),) * (c.ndim - 2), constant_values=255)
+                 for c in r]
         lines.append(np.hstack(cells))
     full = max(line.shape[1] for line in lines)
-    return np.vstack([np.pad(line, ((0, 8), (0, full - line.shape[1])), constant_values=255) for line in lines])
+    return np.vstack([np.pad(line, ((0, 8), (0, full - line.shape[1])) + ((0, 0),) * (line.ndim - 2),
+                             constant_values=255) for line in lines])
 
 
 def scan_frame(s: dict, px_per_mm: float):
@@ -799,7 +821,7 @@ def set_dimension_values(ctx: Ctx, scan: Annotated[str, "The scan id returned by
                                                 "'{\"D1\": 61, \"D2\": 52.2}'. Leave out any you cannot read"] = "{}",
                          scale_from: Annotated[str, "For a scan with too few dimensions: the id of a scan at the same "
                                                     "drawing scale whose values are set (e.g. the dimensioned copy "
-                                                    "of the same blank); its scale is used"] = "") -> dict:
+                                                    "of the same blank); its scale is used"] = "") -> dict | ToolOutput:
     """Fit one mm-per-pixel scale to the dimension values you read, check every dimension against it (a misread
     value or a wrong arrow pairing shows as a large error), and convert the scan's geometry to mm. A scan without
     dimensions takes the scale of another scan (scale_from), checked against that scan's overall sizes."""
@@ -868,6 +890,19 @@ def set_dimension_values(ctx: Ctx, scan: Annotated[str, "The scan id returned by
     if s.get("blank"):
         result["blank_mm"] = blank_in_mm(s, px_per_mm)
     run.trace("scan_values", scan=scan, values=read, result=result)
+    if result["suspect"]:
+        # each value that disagrees with its line's length, shown again with its line in red and the values around
+        # it: read the one on the red line (the first crop may have shown a neighbour's value)
+        gray = cv2.imread(str(Path(s["folder"]) / "view.png"), cv2.IMREAD_GRAYSCALE)
+        tiles = [value_tile(gray, d, wide=True, zoom=3) for d in s["dimensions"] if d["id"] in result["suspect"]]
+        tiles = [t for t in tiles if t is not None]
+        if gray is not None and tiles:
+            result["recheck"] = ("The suspect values are shown again, each with its own dimension line in red and the "
+                                 "values around it. Read the value written on the red line, and call "
+                                 "set_dimension_values again with the corrected values (keep the ones that checked out).")
+            log.info("scan %s: %d suspect value(s) shown again for a re-read", scan, len(tiles))
+            return ToolOutput(result, [(f"Scan {scan}: suspect dimensions, each with its line in red: read the value "
+                                        "on the red line", cv2.imencode(".png", crop_grid(tiles))[1].tobytes())])
     log.info("scan %s: %.3f px/mm from %d value(s); suspect: %s", scan, px_per_mm, len(pairs),
              result["suspect"] or "none")
     return result
@@ -1046,8 +1081,18 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
         if "temperature" in agent.settings:
             kwargs["temperature"] = agent.settings["temperature"]
         t0 = time.monotonic()
-        reply = run.client.chat.completions.create(model=MODEL, messages=messages,
-                                                   extra_body={"usage": {"include": True}}, **kwargs)
+        extra = {"usage": {"include": True}} | reasoning_setting(agent)
+        reply = run.client.chat.completions.create(model=MODEL, messages=messages, extra_body=extra, **kwargs)
+        choice = reply.choices[0]
+        if not (choice.message.content or choice.message.tool_calls) and choice.finish_reason == "length":
+            # a reasoning model can spend the whole budget thinking and say nothing: ask again without reasoning
+            alog.warning("turn %d: empty reply, the token budget went on hidden reasoning; asking again without it",
+                         turn)
+            run.trace("empty_reasoning_reply", agent=label, turn=turn, usage=reply.usage.model_dump() if reply.usage else {})
+            if reply.usage and (reply.usage.model_dump().get("cost") is not None):
+                run.cost_usd += reply.usage.model_dump()["cost"]
+            reply = run.client.chat.completions.create(model=MODEL, messages=messages, **kwargs, extra_body={
+                "usage": {"include": True}, "reasoning": {"enabled": False}})
         usage = reply.usage.model_dump() if reply.usage else {}
         cost = usage.get("cost")
         if cost is None:
@@ -1119,6 +1164,17 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
             messages.append({"role": "user", "content": parts})
 
     raise RuntimeError(f"{label} gave no valid answer in {max_turns} turns (+{REPAIR_TURNS} repair turns)")
+
+
+def reasoning_setting(agent: Agent) -> dict:
+    """The agent's `reasoning` setting (YAML) for OpenRouter: `off` (answer directly: perception, reading),
+    `low` / `medium` / `high` (think first, as hard as that: planning, judging). Left out: the model's default."""
+    level = str(agent.settings.get("reasoning", "")).lower()
+    if level in ("off", "false"):          # YAML reads a bare `off` as false
+        return {"reasoning": {"enabled": False}}
+    if level in ("low", "medium", "high"):
+        return {"reasoning": {"effort": level}}
+    return {}
 
 
 def missing_steps(agent: Agent, run: Run, used: set[str]) -> list[str]:

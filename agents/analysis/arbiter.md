@@ -1,5 +1,6 @@
 ---
 name: analysis/arbiter
+reasoning: medium   # off | low | medium | high (main.py reasoning_setting)
 description: Settles disagreements and gaps between the view analyses, from the drawing itself, before the part is planned.
 model: openai/gpt-6-luna
 temperature: 0.1

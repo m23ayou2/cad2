@@ -1,5 +1,6 @@
 ---
 name: validation/side
+reasoning: low   # off | low | medium | high (main.py reasoning_setting)
 description: Compares the built model with a side view of the drawing and reports what matches and what must be fixed.
 model: openai/gpt-6-luna
 temperature: 0.1

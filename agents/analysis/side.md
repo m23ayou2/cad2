@@ -1,5 +1,6 @@
 ---
 name: side
+reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses a side view (left or right elevation) of a drawing, which gives depths and heights.
 model: openai/gpt-6-luna
 temperature: 0.1

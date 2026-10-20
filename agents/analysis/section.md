@@ -1,5 +1,6 @@
 ---
 name: section
+reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses a section view (e.g. SECTION A-A), which reveals internal cavities, bores and wall thicknesses.
 model: openai/gpt-6-luna
 temperature: 0.1

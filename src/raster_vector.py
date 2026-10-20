@@ -188,8 +188,8 @@ def outline_and_holes(part: np.ndarray) -> dict:
 
 def dimensions(sep: dict, text: np.ndarray) -> list[dict]:
     """A dimension is two arrowheads on one line, facing each other: its length is tip to tip, whatever the ink
-    between them looks like. An arrowhead with no partner is a leader. Each dimension gets the box of the value text
-    nearest its middle, for a vision model to read."""
+    between them looks like. An arrowhead with no partner is a leader. Each dimension gets the box of its own value
+    text (assign_texts: by geometry, not by distance to its middle), for a vision model to read."""
     arrows = sep.get("dimension_runs", [])
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(
         cv2.dilate(text.astype(np.uint8), np.ones((5, 5), np.uint8)), 8)
@@ -216,20 +216,53 @@ def dimensions(sep: dict, text: np.ndarray) -> list[dict]:
         # tips: half an arrowhead beyond each centre, outward
         tip_a = np.array(a["centre"], float) - d * a["length"] / 2
         tip_b = np.array(b["centre"], float) + d * b["length"] / 2
-        mid = (tip_a + tip_b) / 2
-        box = None
-        if n > 1:
-            k = 1 + int(np.argmin([np.linalg.norm(centroids[m] - mid) for m in range(1, n)]))
-            if np.linalg.norm(centroids[k] - mid) < 60:
-                x, y, w, h, _ = stats[k]
-                box = [int(x), int(y), int(x + w), int(y + h)]
         out.append({"from": tip_a.round(1).tolist(), "to": tip_b.round(1).tolist(),
                     "length_px": round(float(np.linalg.norm(tip_b - tip_a)), 1),
                     "orientation": "horizontal" if abs(d[0]) > 0.9 else "vertical" if abs(d[1]) > 0.9 else "angled",
-                    "text_box": box})
+                    "text_box": None})
+    assign_texts(out, stats[1:n] if n > 1 else np.zeros((0, 5)))
     leaders = [{"at": np.array(a["centre"]).round(1).tolist(), "direction": np.round(a["direction"], 3).tolist()}
                for i, a in enumerate(arrows) if i not in paired]
     return out, leaders
+
+
+def assign_texts(dims: list[dict], boxes: np.ndarray, reach: float = 25.0) -> None:
+    """Give each dimension its own value text. A dimension's text sits beside its line (or on it, broken by it),
+    between its arrowheads, and runs the same way as the line (rotated, so a tall box, on a vertical dimension). In a
+    stack of parallel dimensions the text nearest a line's middle is often the neighbour's, so the choice is made for
+    all dimensions at once: candidate pairs from the closest fit, each text to one dimension only. Sets text_box."""
+    pairs = []
+    for i, d in enumerate(dims):
+        p, q = np.array(d["from"], float), np.array(d["to"], float)
+        length = float(np.linalg.norm(q - p)) or 1.0
+        u = (q - p) / length
+        nrm = np.array([-u[1], u[0]])
+        mid = (p + q) / 2
+        for k, (x, y, w, h, _) in enumerate(boxes):
+            corners = np.array([[x, y], [x + w, y], [x, y + h], [x + w, y + h]], float)
+            along = (corners - mid) @ u
+            across = (corners - mid) @ nrm
+            # gap between the line and the box, across the line (negative: the line runs through the box)
+            gap = 0.0 if across.min() <= 0 <= across.max() else float(np.abs(across).min())
+            if gap > reach:
+                continue
+            # the text lies between the arrowheads (a little beyond them on a short dimension)
+            slack = 10.0 if length > 60 else 35.0
+            beyond = max(0.0, float(np.abs(along).min()) - length / 2 - slack) if (along.min() > length / 2 or along.max() < -length / 2) else 0.0
+            if beyond > 0:
+                continue
+            extent_along, extent_across = float(np.ptp(along)), float(np.ptp(across))
+            turned = extent_across > 1.4 * extent_along and extent_along < 12      # runs across the line
+            cost = gap + (15.0 if turned else 0.0) + 0.05 * abs(float(np.mean(along)))
+            pairs.append((cost, i, k))
+    used_d, used_t = set(), set()
+    for cost, i, k in sorted(pairs):
+        if i in used_d or k in used_t:
+            continue
+        x, y, w, h, _ = boxes[k]
+        dims[i]["text_box"] = [int(x), int(y), int(x + w), int(y + h)]
+        used_d.add(i)
+        used_t.add(k)
 
 
 def find_holes(part: np.ndarray, min_r=4, max_r=40) -> list[dict]:

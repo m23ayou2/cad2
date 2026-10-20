@@ -1,5 +1,6 @@
 ---
 name: front
+reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 description: Analyses the front view of a drawing, the main elevation that gives widths and heights.
 model: openai/gpt-6-luna
 temperature: 0.1
