@@ -56,19 +56,21 @@ import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
-MODEL = "openai/gpt-6-luna" 
-MODEL = "anthropic/claude-haiku-5.5"   # skipped for now, for both images and reasoning
-# Two roles: agents marked `role: vision` in their YAML (looking at images: view analyses, path agent, corner
-# check, the validators' looking step) run on VISION_MODEL; the rest (planner, builder, arbiter, validators'
-# judging step, red team) on MODEL, the reasoning model. Set both to the same id to use one model.
-VISION_MODEL = "qwen/qwen3-vl-30b-a3b-instruct"
-SPLIT_VALIDATION = True   # validation in two steps: the vision model describes, the reasoning model judges
+# MODEL = "openai/gpt-6-luna"
+MODEL = "anthropic/claude-haiku-5.5"   # one model for everything: looking at images and reasoning
+# Agents marked `role: vision` in their YAML run on VISION_MODEL, the rest on MODEL. Both are the same model for
+# now (no separate vision model); set VISION_MODEL to another id to split them again.
+VISION_MODEL = MODEL
+SPLIT_VALIDATION = False   # validation in two steps: the vision model describes, the reasoning model judges
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
 CAD_TIMEOUT_S = 120
 VALIDATE_TIMEOUT_S = 600
 MAX_CORRECTIONS = 2  # validate -> correct rounds after the first build
+STOP_SCORE = 0.90    # a round whose trusted views agree this well is accepted, whatever issues the agents raise
+AGREES = 0.85        # a view agreeing this well cannot carry a high-severity issue
+REGRESSION = 0.02    # a correction that loses more agreement than this is undone, and the loop stops
 SubagentName = Literal["front", "top", "side", "section", "detail", "isometric"]
 
 log = logging.getLogger("draw2cad")
@@ -475,6 +477,7 @@ def run_cadquery(ctx: Ctx, code: Annotated[str, "The complete CadQuery script; i
     if result.get("ok"):
         shutil.copyfile(script, run.dir / "model.py")
         shutil.copyfile(step, run.dir / "model.step")
+        shutil.copyfile(report, run.dir / "model_report.json")      # its measurements and recipe checkpoints
         log.getChild("cad").info("attempt %d ok: size %s, volume %s", run.build_attempts,
                                  result["bbox"]["size"], result["volume"])
     else:
@@ -1140,8 +1143,9 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
                         context["texts"] = drawing_texts(run)
                     if ctx.check and "corners" in ctx.check:
                         context["corners"] = ctx.check["corners"]
-                    if ctx.check and "previous_frame" in ctx.check:
-                        context["previous_frame"] = ctx.check["previous_frame"]
+                    for key in ("previous_frame", "previous_features", "allowed_features"):
+                        if ctx.check and key in ctx.check:
+                            context[key] = ctx.check[key]
                     result = agent.output_model.model_validate(result, context=context).model_dump(mode="json")
             except (ValueError, ValidationError) as error:
                 problem = validation_problems(error)
@@ -1309,6 +1313,9 @@ def save_plan(run: Run, result: dict) -> dict:
     for f in tree["features"]:
         log.info("  %s %-18s %-30s %s", f["id"], f["op"], f["name"][:30],
                  ", ".join(f"{k}={v}" for k, v in f["params"].items() if not isinstance(v, list)))
+    for st in (result.get("recipe") or {}).get("steps", []):
+        log.info("  recipe %d: %s (%s)%s", st["step"], st["operation"], ", ".join(st["features"]),
+                 f" -> expected {st['expected_size_mm']}" if st.get("expected_size_mm") else "")
     log.info("plan: %d feature(s), %d assumption(s), %d unsupported", len(tree["features"]),
              len(tree["assumptions"]), len(tree["unsupported"]))
     return result
@@ -1330,7 +1337,7 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
         path = run.dir / s["file"]
         if path.is_file():
             summaries[s["view"]] = json.loads(path.read_text(encoding="utf-8"))
-    current = {k: plan_result[k] for k in ("overview", "feature_tree", "uncertainties") if k in plan_result}
+    current = {k: plan_result[k] for k in ("overview", "feature_tree", "recipe", "uncertainties") if k in plan_result}
     text = (f"# Revision {round_no}\n\nThe part was built from your plan and checked against every view of the "
             "drawing. The checks found the problems below in the **plan itself**. This is a revision: do not "
             "split the views or call subagents again; the view summaries below are still valid. Re-read the "
@@ -1341,6 +1348,9 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
             "measured (often a small pictorial view, where hidden steps cannot be seen): treat it as a hint. "
             "If an issue contradicts a dimension you read from a section or an orthographic view, keep your value "
             "and say why in `uncertainties`; do not remove a feature the drawing dimensions.\n\n"
+            "**Change only what the issues name.** Features no issue names stay exactly as they are (the harness "
+            "rejects a revision that changes them); new features only for a missing feature or a whole-part issue. "
+            "Keep the recipe in step with the tree.\n\n"
             "**The frame card (`feature_tree.frame`) is frozen.** Fix features inside it; never flip, mirror or "
             "re-orient one feature or one view to make it fit. Change the frame only for the whole part, when at "
             "least two independent views (or the orientation check) show it is wrong, and record that in "
@@ -1353,15 +1363,20 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
                + json.dumps(plan_result["cross_check"].get("rulings", []), indent=1, ensure_ascii=False) + "\n```"
                if (plan_result.get("cross_check") or {}).get("rulings") else ""))
     previous = plan_result["feature_tree"].get("frame") or {}
-    result = run_agent(agent, Ctx(run, None, {"previous_frame": previous}), [{"type": "text", "text": text}],
-                       label=f"main[revision {round_no}]")
+    cited = {i["feature"] for i in issues if i.get("feature")}
+    allowed = {"features": sorted(cited), "new": any(not i.get("feature") or i["kind"] == "missing" for i in issues)}
+    result = run_agent(agent, Ctx(run, None, {"previous_frame": previous,
+                                              "previous_features": plan_result["feature_tree"]["features"],
+                                              "allowed_features": allowed}),
+                       [{"type": "text", "text": text}], label=f"main[revision {round_no}]")
     return save_plan(run, {**result, "summaries": plan_result.get("summaries", []),
                            "cross_check": plan_result.get("cross_check")})
 
 
 def build(run: Run, plan_result: dict, corrections: dict | None = None) -> dict:
     """Builder agent: feature tree -> model.py + model.step, then viewer.html."""
-    brief = {"overview": plan_result.get("overview"), "feature_tree": plan_result["feature_tree"]}
+    brief = {"overview": plan_result.get("overview"), "feature_tree": plan_result["feature_tree"],
+             "recipe": plan_result.get("recipe")}
     text = "Build this part.\n\n```json\n" + json.dumps(brief, indent=1, ensure_ascii=False) + "\n```"
     if corrections:
         for name in ("model.step", "model.py"):  # archived by validate(); a failed rebuild must not reuse them
@@ -1504,7 +1519,8 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
         vlog.warning("projection check failed: %s; model not validated", error)
         return result
     result["pose"] = data.get("pose")
-    result["measured"] = [{"view": e["view_id"], **e["metrics"]} for e in data["views"] if e.get("metrics")]
+    result["measured"] = [{"view": e["view_id"], **e["metrics"], "agreement": agreement(e), "trusted": trusted_view(e)}
+                          for e in data["views"] if e.get("metrics")]
     vlog.info("projections done in %.1fs; pose: %s", time.monotonic() - t0, (data.get("pose") or {}).get("verdict"))
     run.trace("projections", round=round_no, data=data)
 
@@ -1677,8 +1693,15 @@ def weigh_by_evidence(report: dict, entry: dict, vlog: logging.Logger) -> dict:
     become advisory: low severity, so they never start a correction round on their own."""
     measured = "metrics" in entry
     doubt = entry.get("camera_doubt")
+    agree = agreement(entry) if measured else 0.0
     issues = []
     for issue in report["issues"]:
+        # a high issue needs measured support: none on a view that agrees well, none without evidence
+        if issue["severity"] == "high" and measured and (agree >= AGREES or not issue.get("evidence")):
+            why = (f"the view agrees with the model ({agree:.2f} measured)" if agree >= AGREES else
+                   "it cites no measured evidence")
+            vlog.info("    not high (%s): %s %s", why, issue.get("feature") or "-", issue["description"][:120])
+            issue = {**issue, "severity": "low", "gated": why}
         issue = {**issue, "basis": "measured view" if measured and not doubt else
                  "camera in doubt: " + doubt if doubt else "visual only: this view was not measured"}
         if issue["severity"] == "high" and (not measured or doubt):
@@ -1709,9 +1732,70 @@ def escalate(issues: list[dict], sent_to: dict):
             log.info("    escalated to the planner: %s %s", issue.get("feature") or "-", issue["kind"])
 
 
+def agreement(entry: dict) -> float:
+    """How well one view and the model agree, measured (0..1): the filled silhouettes' overlap when the check made
+    them, else the mean of the edge coverages both ways."""
+    m = entry.get("metrics") or {}
+    if m.get("silhouette_iou") is not None:
+        return float(m["silhouette_iou"])
+    return (float(m.get("drawn_covered") or 0) + float(m.get("model_covered") or 0)) / 2
+
+
+def trusted_view(entry: dict) -> bool:
+    """A view whose camera was not searched for its fit: a vector view, a view on the frame card's camera, or a
+    search that clearly picked one camera. Only these can show the model agrees with the drawing."""
+    if "camera_source" not in entry and "separation" not in entry:
+        return True                                   # vector views: projected from the view's own direction
+    return entry.get("camera_source") == "card" or bool((entry.get("separation") or {}).get("decided"))
+
+
+def round_score(check: dict) -> float:
+    """The round's measured agreement: the mean over its trusted views (all views if none is trusted)."""
+    views = [m for m in check.get("measured", []) if m.get("trusted")] or check.get("measured", [])
+    return round(float(np.mean([m["agreement"] for m in views])), 3) if views else 0.0
+
+
+def check_recipe(run: Run, plan_result: dict) -> list[dict]:
+    """Compare the build's checkpoints with the recipe: the first step whose part does not have the size the
+    recipe expects becomes an issue about that step (later steps build on it, so only the first counts)."""
+    recipe = (plan_result.get("recipe") or {}).get("steps", [])
+    try:
+        points = {c["step"]: c for c in json.loads((run.dir / "model_report.json").read_text()).get("checkpoints", [])}
+    except (OSError, json.JSONDecodeError):
+        points = {}
+    issues, missing = [], []
+    for st in recipe:
+        expected, got = st.get("expected_size_mm"), points.get(st["step"])
+        if got is None:
+            missing.append(st["step"])
+            continue
+        if not expected or "size" not in got:
+            continue
+        close = lambda b, e: abs(b - e) <= max(2.0, 0.05 * e)
+        if all(close(b, e) for b, e in zip(got["size"], expected)):
+            continue
+        swapped = all(close(b, e) for b, e in zip(sorted(got["size"]), sorted(expected)))
+        issues.append({
+            "kind": "wrong_orientation" if swapped else "wrong_size", "severity": "high", "owner": "build",
+            "feature": st["features"][0],
+            "description": f"Recipe step {st['step']} ({st['operation']}; features {', '.join(st['features'])}) gives a "
+                           f"part {got['size']} along X, Y, Z; the recipe expects {expected}"
+                           + (" (the same sizes on other axes)" if swapped else "") + f". Check: {st['check']}",
+            "drawing": st["source"], "model": f"checkpoint {st['step']}: size {got['size']}, volume {got.get('volume')}",
+            "fix": f"Rebuild step {st['step']} as the recipe says; the steps after it build on it.",
+            "evidence": [f"recipe checkpoint {st['step']}"], "basis": "measured: recipe checkpoint"})
+        break
+    if missing and recipe:
+        log.info("recipe: no checkpoint for step(s) %s", missing)
+    for i in issues:
+        log.warning("recipe: %s", i["description"])
+    return issues
+
+
 def round_rank(r: dict):
-    """Best round first: fewest high-severity issues, then the best measured fit, then the latest."""
-    return r["high_issues"], -r["drawn_covered"], -r["round"]
+    """Best round first: the best measured agreement on its trusted views, then the fewest high-severity issues,
+    then the latest. Issue counts alone mislead: agents raise issues on parts that agree with the drawing."""
+    return -r.get("score", 0.0), r["high_issues"], -r["round"]
 
 
 def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Path:
@@ -1741,6 +1825,7 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
             log.warning("path analysis failed: %s", error)
     started = time.monotonic()
     rounds, report, corrections = [], {"status": "failed"}, None
+    plans = {}  # round -> the plan it was built from, to restore with the round kept
     sent_to = {}  # issue key -> owner it was sent to in the last correction round
     try:
         if rebuild:
@@ -1755,6 +1840,7 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
             issues = [i for r in check["reports"] for i in r["issues"]]
             if getattr(run, "frame_issue", None):
                 issues.append(run.frame_issue)
+            issues += check_recipe(run, plan_result)
             pose = check.get("pose") or {}
             if pose.get("better_orientation_found"):
                 issues.append({
@@ -1773,12 +1859,25 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
             escalate(issues, sent_to)
             high = [i for i in issues if i["severity"] == "high"]
             covered = [m["drawn_covered"] for m in check["measured"]]
-            rounds.append({"round": round_no, "build": report["status"], "high_issues": len(high),
+            score = round_score(check)
+            plans[round_no] = json.loads(json.dumps({k: plan_result.get(k) for k in ("overview", "feature_tree",
+                                                                                   "recipe", "uncertainties")}))
+            rounds.append({"round": round_no, "build": report["status"], "high_issues": len(high), "score": score,
                            "validated_views": len(check["reports"]), "measured_views": len(covered),
                            "drawn_covered": round(sum(covered) / len(covered), 3) if covered else 0.0,
                            "verdicts": {r["view"]: r["verdict"] for r in check["reports"]}})
             mark_features(run, plan_result, check, high)
+            log.info("round %d: measured agreement %.3f on the trusted views, %d high issue(s)", round_no, score,
+                     len(high))
             if not check["reports"]:
+                break
+            best_before = max((r["score"] for r in rounds[:-1]), default=None)
+            if best_before is not None and score < best_before - REGRESSION:
+                log.warning("round %d agrees less than an earlier round (%.3f < %.3f): the correction is undone and "
+                            "the loop stops", round_no, score, best_before)
+                break
+            if score >= STOP_SCORE:
+                log.info("validation: the trusted views agree (%.3f >= %.2f); accepted", score, STOP_SCORE)
                 break
             if not high:
                 log.info("validation: no high-severity issue in round %d", round_no)
@@ -1796,7 +1895,7 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
             corrections = {"round": round_no, "plan_revised": bool(plan_issues),
                            "issues": [i for i in issues if i["owner"] == "build"],
                            "previous_script": (run.dir / "model.py").read_text(encoding="utf-8")}
-        keep_best_round(run, rounds)
+        keep_best_round(run, rounds, plans)
         red_team = red_team_review(run, rounds)
     except Exception as error:
         run.trace("run_end", ok=False, error=f"{type(error).__name__}: {error}", cost_usd=run.cost_usd)
@@ -1812,7 +1911,8 @@ def solve(drawing: Path, rebuild: Path | None = None, paths: bool = False) -> Pa
         "measured_views": final["measured_views"] if final else 0,
         "drawn_covered": final["drawn_covered"] if final else None,
         "high_issues_left": final["high_issues"] if final else None,
-        "kept_round": final["round"] if final else None, "rounds": rounds,
+        "kept_round": final["round"] if final else None, "score": final.get("score") if final else None,
+        "rounds": rounds,
         "step": "model.step" if (run.dir / "model.step").is_file() else None,
         "script": "model.py" if (run.dir / "model.py").is_file() else None,
         "plan": "plan.json", "feature_tree": "feature_tree.json", "build_report": "build_report.json",
@@ -1839,9 +1939,9 @@ def mark_features(run: Run, plan_result: dict, check: dict, high: list[dict]):
     (run.dir / "feature_tree.json").write_text(json.dumps(tree, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def keep_best_round(run: Run, rounds: list[dict]):
-    """A correction can make things worse: keep the round with the fewest high-severity issues, and between
-    equals the one whose projections cover the drawing best."""
+def keep_best_round(run: Run, rounds: list[dict], plans: dict | None = None):
+    """A correction can make things worse: keep the round whose trusted views agree best with the drawing, with the
+    plan it was built from."""
     if not rounds:
         return
     best = min(rounds, key=round_rank)
@@ -1850,8 +1950,15 @@ def keep_best_round(run: Run, rounds: list[dict]):
     source = run.dir / "validation" / f"round_{best['round']}"
     for name in ("model.step", "model.py"):
         shutil.copyfile(source / name, run.dir / name)
-    log.warning("keeping round %d (%d high issue(s)): the later rounds were not better", best["round"],
-                best["high_issues"])
+    if plans and best["round"] in plans:
+        kept = plans[best["round"]]
+        (run.dir / "feature_tree.json").write_text(json.dumps(kept["feature_tree"], indent=2, ensure_ascii=False),
+                                                   encoding="utf-8")
+        plan_file = run.dir / "plan.json"
+        full = json.loads(plan_file.read_text(encoding="utf-8")) if plan_file.is_file() else {}
+        plan_file.write_text(json.dumps({**full, **kept}, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.warning("keeping round %d (agreement %.3f, %d high issue(s)): the later rounds were not better",
+                best["round"], best.get("score", 0.0), best["high_issues"])
     write_viewer(run)
 
 

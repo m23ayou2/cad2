@@ -5,6 +5,10 @@
 The script must assign the final part to `result`. The report says whether the
 part is one valid solid, and gives its bounding box, volume, face count, and the
 cylindrical faces grouped by diameter, so the builder can check its own work.
+
+The script can call `checkpoint(step, shape)` after each step of the plan's recipe:
+the part as it stands then is measured (size, volume, solids) and listed in the
+report under `checkpoints`, so the harness can check every step, not only the end.
 """
 import json
 import sys
@@ -61,7 +65,23 @@ def run(script: str, step: str) -> dict:
     import cadquery as cq
 
     make_union_order_safe(cq)
-    namespace = {"__name__": "__main__", "__file__": script}
+    checkpoints = []
+
+    def checkpoint(step, shape):
+        """Measure the part as it stands after a recipe step."""
+        objs = shape.vals() if isinstance(shape, cq.Workplane) else [shape]
+        objs = [o for o in objs if isinstance(o, cq.Shape)]
+        if not objs:
+            checkpoints.append({"step": step, "error": "no shape"})
+            return shape
+        s = objs[0] if len(objs) == 1 else cq.Compound.makeCompound(objs)
+        b = s.BoundingBox()
+        checkpoints.append({"step": step, "size": [round(b.xlen, 2), round(b.ylen, 2), round(b.zlen, 2)],
+                            "min": [round(b.xmin, 2), round(b.ymin, 2), round(b.zmin, 2)],
+                            "volume": round(s.Volume(), 1), "solids": len(s.Solids())})
+        return shape
+
+    namespace = {"__name__": "__main__", "__file__": script, "checkpoint": checkpoint}
     with open(script, encoding="utf-8") as f:
         exec(compile(f.read(), script, "exec"), namespace)
     result = namespace.get("result")
@@ -89,6 +109,7 @@ def run(script: str, step: str) -> dict:
             shape = fused.Solids()[0] if len(fused.Solids()) == 1 else fused
     report = measure(shape)
     report["notes"] = notes
+    report["checkpoints"] = checkpoints
     problems = []
     if report["solids"] == 0:
         problems.append("the result contains no solid")

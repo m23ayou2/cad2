@@ -2,6 +2,7 @@
 name: validation/look
 description: Looks at one view of the drawing next to the model seen from the same camera and lists every difference.
 role: vision      # runs on VISION_MODEL (main.py)
+reasoning: off   # off | low | medium | high (main.py reasoning_setting)
 temperature: 0
 max_turns: 2
 tools: []

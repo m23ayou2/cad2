@@ -9,6 +9,7 @@ points at views that exist.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Annotated, Literal, Union
 
@@ -355,6 +356,40 @@ class FeatureTree(Strict):
     unsupported: list[Unsupported] = Field(default_factory=list)
 
     @model_validator(mode="after")
+    def only_cited_changes(self, info: ValidationInfo) -> FeatureTree:
+        """In a revision, a feature changes only if an issue names it: a correction must not touch the work that
+        was already right. Issues that name no feature (a missing feature, the whole part) allow new features."""
+        ctx = info.context or {}
+        previous, allowed = ctx.get("previous_features"), ctx.get("allowed_features")
+        if previous is None or allowed is None:
+            return self
+        keys = ("op", "params", "position", "direction", "pattern", "placements", "long_axis", "extends_into", "targets")
+        def normal(raw: dict) -> dict:     # both sides through the model, so defaults read the same
+            try:
+                return Feature.model_validate(raw).model_dump(mode="json")
+            except Exception:
+                return raw
+        old = {f["id"]: normal(f) for f in previous}
+        changed = []
+        for f in self.features:
+            if f.id in old:
+                before = {k: old[f.id].get(k) for k in keys}
+                after = {k: v for k, v in f.model_dump(mode="json").items() if k in keys}
+                after = {k: after.get(k) for k in keys}
+                if json.dumps(before, sort_keys=True, default=str) != json.dumps(after, sort_keys=True, default=str) \
+                        and f.id not in allowed["features"]:
+                    changed.append(f.id)
+            elif not allowed["new"]:
+                changed.append(f"{f.id} (new)")
+        removed = [i for i in old if i not in {f.id for f in self.features} and i not in allowed["features"]]
+        if changed or removed:
+            raise ValueError(f"this revision changes features no issue names: {changed + [r + ' (removed)' for r in removed]}. "
+                             f"Change only {sorted(allowed['features'])}"
+                             + (", or add new features" if allowed["new"] else "")
+                             + ", and keep every other feature exactly as it was")
+        return self
+
+    @model_validator(mode="after")
     def consistent(self) -> FeatureTree:
         errors, seen = [], set()
         for f in self.features:
@@ -403,11 +438,61 @@ class Overview(Strict):
     notes: list[str] = Field(default_factory=list)
 
 
+class RecipeStep(Strict):
+    """One step of making the part, in order: the stock, then each operation."""
+    step: int = Field(ge=1)
+    operation: str = Field(description="What is done, e.g. 'flat blank 3 mm', 'bend B2 up 90 deg R3', "
+                                       "'turn the profile', 'drill 4x 6.6 thru'")
+    features: list[str] = Field(min_length=1, description="The feature ids this step creates, e.g. ['F02']")
+    source: str = Field(description="Where the drawing says so: the view and the callout or dimensions, as printed")
+    expected_size_mm: list[float] | None = Field(None, min_length=3, max_length=3, description=(
+        "The part's overall size along X, Y, Z right after this step, when it can be worked out (the blank: its "
+        "size and thickness; after a bend: the new extent). The harness measures it after the step"))
+    check: str = Field(description="What the part must show after this step, to check it: e.g. 'panel P3 stands "
+                                   "up on the left, as in the isometric'")
+
+
+class Recipe(Strict):
+    """How the part is made, read off the sheet: the stock, then the operations in order, then the views that
+    show the finished part (they are the check, not a source of geometry)."""
+    sheet_reading: str = Field(description="What the sheet is, e.g. 'flat blank with BEND callouts, a dimensioned "
+                                           "copy of it, and two isometrics of the formed part'")
+    steps: list[RecipeStep] = Field(min_length=1)
+    check_views: list[str] = Field(default_factory=list, description="Views that show the finished part")
+
+
 class PartPlan(Strict):
     """The main agent's answer."""
     overview: Overview
     feature_tree: FeatureTree
+    recipe: Recipe
     uncertainties: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def recipe_covers_tree(self) -> PartPlan:
+        ids = [f.id for f in self.feature_tree.features]
+        listed = [fid for st in self.recipe.steps for fid in st.features]
+        missing = [i for i in ids if i not in listed]
+        unknown = sorted({i for i in listed if i not in ids})
+        twice = sorted({i for i in listed if listed.count(i) > 1})
+        numbers = [st.step for st in self.recipe.steps]
+        problems = []
+        if missing:
+            problems.append(f"features in no recipe step: {missing}")
+        if unknown:
+            problems.append(f"recipe steps name unknown features: {unknown}")
+        if twice:
+            problems.append(f"features in two recipe steps: {twice}")
+        if numbers != sorted(numbers) or len(set(numbers)) != len(numbers):
+            problems.append(f"recipe steps must be numbered in order: {numbers}")
+        order = {fid: k for k, fid in enumerate(ids)}
+        firsts = [min(order[f] for f in st.features if f in order) for st in self.recipe.steps if any(f in order for f in st.features)]
+        if firsts != sorted(firsts):
+            problems.append("recipe steps must follow the feature tree's order (a step's features come after "
+                            "the previous step's)")
+        if problems:
+            raise ValueError("recipe: " + "; ".join(problems))
+        return self
 
 
 class BuiltFeature(Strict):

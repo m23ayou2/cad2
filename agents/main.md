@@ -102,7 +102,17 @@ A wrong first guess at the part's orientation spoils everything after it: every 
 
 **The card is frozen for the whole run.** No later step may flip, mirror or re-orient one feature, one view or one hole pattern to make it fit. A change of frame is a separate decision: only for the whole part ("rotate the part 90 deg about Z"), only when at least two independent views (or the orientation check) show the card is wrong, and recorded in `frame.revisions`. The harness rejects any other change to the card, translates the built model so the card's rules hold (never rotating it), and checks the built size along X, Y and Z against `expected_bbox_mm`: sizes on the wrong axes come back as an orientation issue.
 
-## 6. Plan the part: build the feature tree
+## 6. Read the sheet as a recipe
+
+A drawing usually tells you how the part is made, not only what it looks like. A sheet-metal sheet gives the stock (the flat blank, with its holes), then the operations written on it (`BEND UP R1` here, `BEND DOWN` there), with their parameters in the notes, and pictorial views of the finished part. A turned part is stock, then the turned profile, then cuts and holes; a plate is its outline, then pockets, then holes. Read the sheet that way and write the **recipe** (`recipe`):
+
+- `sheet_reading`: what the sheet is, in one sentence ("flat blank with BEND callouts, a dimensioned copy of it, two isometrics of the formed part").
+- `steps`, in the order a workshop would make the part: the stock first, then one step per operation (a bend, a cut, a hole pattern). For each: the `operation`, the feature ids it creates (`features`, in the tree's order), the `source` on the drawing (the view and the callout or dimensions, as printed), the part's `expected_size_mm` right after it whenever you can work it out (the blank: its size and thickness; after a bend: the new extent along X, Y and Z), and the `check`: what the part must show after the step ("panel P3 stands up on the left, as in the isometric").
+- `check_views`: the views that show the finished part. **They are the check, not a source of geometry**: positions and sizes come from the operations' own views and dimensions.
+
+Every feature belongs to exactly one step. The builder makes the part step by step and the harness measures it after each one: a step whose part does not match its expected size comes back as an issue about that step, before the later steps hide it.
+
+## 7. Plan the part: build the feature tree
 
 Write **one feature tree for the whole part**, in the order a CAD modeller would build it. Each feature has:
 
@@ -184,7 +194,8 @@ After the part is built, it is projected into every view of the drawing and chec
 Reply with one JSON object matching the output schema, and nothing else:
 
 - `overview`: the summary from step 1.
-- `feature_tree`: the frame card from step 5, the features from step 6, the assumptions, and anything unsupported.
+- `feature_tree`: the frame card from step 5, the features from step 7, the assumptions, and anything unsupported.
+- `recipe`: the recipe from step 6, in step with the tree.
 - `uncertainties`: conflicts between views, unreadable values, missing views, and anything you could not interpret.
 
 The view summaries are saved separately by the harness; do not repeat them.

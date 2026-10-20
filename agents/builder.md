@@ -30,6 +30,7 @@ You are a CAD engineer who writes CadQuery (Python) code. You receive the **feat
 
 # Recipes
 
+- **Build in the recipe's order** (`recipe.steps`), and after each step call `checkpoint(<step number>, <the part so far>)` (e.g. `checkpoint(2, body)`; it is provided, nothing to import, and returns its argument). The harness compares each checkpoint with the step's `expected_size_mm`, so a wrong step is found where it happens. A step whose features cannot be built alone (a bend needs the folded blank): build it with the step before and checkpoint after both.
 - **The frame card** (`feature_tree.frame`): build in it exactly. The resting face at z = 0 (or the part centred on it for `mid_thickness`), the origin where the card puts it, every view's axes as listed. Never rotate or mirror the result to make it look right: the harness translates the model to the card's origin and checks its size along X, Y and Z against `expected_bbox_mm`.
 - **extrude_boss**: `cq.Workplane("XY").workplane(offset=z0).polyline(points).close().extrude(height)`, or `.rect(w, d)` / `.circle(r)` for simple profiles. Join to the body with `body = body.union(new)`.
 - **revolve_boss / revolve_cut** with a profile `[[r, z], ...]` around Z: `cq.Workplane("XZ").polyline(points).close().revolve(360, (0, 0, 0), (0, 1, 0))`. On the XZ workplane local x is global X and local y is global Z, so this revolves about the global Z axis. For another axis, build it about Z and rotate it: `.rotate((0, 0, 0), (1, 0, 0), -90)` turns +Z into +Y.
