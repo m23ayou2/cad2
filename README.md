@@ -18,29 +18,39 @@ You need [uv](https://docs.astral.sh/uv/). Python 3.12 and every dependency are 
 
 ```bash
 uv sync
-uv run python solve.py cases/tier1/01/drawing.pdf
+uv run python solve.py            # web interface at http://127.0.0.1:8000
 ```
 
 Before running, copy `.env.example` to `.env` and set `OPENROUTER_API_KEY` to the
 key we sent you. An existing environment variable takes precedence.
 
-The starter makes one call to `openai/gpt-6-luna` through OpenRouter, executes
-the generated CadQuery script, and renders a PNG with [CadQuery's viewer](https://cadquery.readthedocs.io/en/stable/vis.html#screenshots).
-For PDF input, every page is rasterized and sent in the same call. PNG and JPEG
-inputs are also accepted. Some cases span several sheets: always use the complete PDF
-when evaluating your own harness.
-Each run saves `model.py`, `model.step`, and `render.png` in a new folder under
-`.screenshots/`. It stops on errors; there is no repair loop.
+`solve.py` opens the web interface in your browser:
 
-The cost of each call in USD is printed immediately, even if CAD generation fails.
-OpenRouter's [reported usage](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
-is saved as `usage.json` in the run folder, including cost, token counts, and the
-generation ID. If no cost is reported, it is shown as unavailable, not zero.
+1. **Jobs**: add one or more PDF drawings (or drop them on the page), pick the model (Claude Haiku 5.5 by
+   default; Sonnet 5.5, Opus 5.5 or GPT-6 Luna), optionally add a note, and start. The table lists every job
+   with its state, result, how much of the drawing the part matches, open issues, time, cost and model.
+2. **A job**: the left column is its title block (drawing, state, result, model, time, cost), **Download
+   STEP**, an assessment once it is finished, and its steps (each agent run and check, with time and cost;
+   open one to see what it did, or the full log). The right side shows the **Drawing** while the part is
+   built, then the **3D model** and the **Projections**: the model projected into every view of the drawing,
+   side by side with the drawn view or overlaid on it (drawing black, model red; orange = drawn but missing
+   in the model, purple = in the model but not drawn), how much of each view matches, and every dimension
+   callout checked. **Run projections** projects the current model again (no model calls, about 30 s; vector
+   PDFs only for now). Under the steps, ask questions about the finished part.
 
-Pass a second argument to choose the STEP output path:
-`uv run python solve.py cases/tier1/01/drawing.pdf out.step`.
+Several drawings can run at once: three at a time by default (`--parallel N`), the rest wait in the queue.
+**New drawing** goes back to the start page, which lists recent jobs to reopen. A job can be stopped; its
+run folder is kept. Jobs are saved under `runs/ui/<job>/`
+(the drawing, `job.json`, `log.txt`), and each job's run folder (plan, build
+attempts, validation, `model.step`, `trace.jsonl`, `result.json`) is
+`runs/ui-<job>-<time>/`, so nothing is lost if the server stops: the list comes
+back on restart, and a job that was running is marked interrupted. The interface
+works offline (three.js is served from `web/vendor/`); only OpenRouter is called.
 
-`solve.py` runs the scripts the model writes on your machine, in a child process, with no sandbox.
+One drawing from the command line, without the interface:
+`uv run python main.py cases/tier1/01/drawing.pdf`.
+
+The pipeline runs the scripts the model writes on your machine, in a child process, with no sandbox.
 
 ## Cases
 

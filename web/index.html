@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draw2CAD</title>
+<style>
+/* Direction: a shop inspection sheet. Paper and ink neutrals; one accent, machinist's layout-fluid blue, for
+   actions and selection; green / amber / red only for check results, always with words. IBM Plex Sans for
+   text, Plex Mono for dimensions, times and costs. 3 px corners, 1 px rules, no shadows, no gradients. */
+@font-face { font-family: "Plex Sans"; src: url(/vendor/fonts/plex-sans-400.woff2) format("woff2"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Plex Sans"; src: url(/vendor/fonts/plex-sans-500.woff2) format("woff2"); font-weight: 500; font-display: swap; }
+@font-face { font-family: "Plex Sans"; src: url(/vendor/fonts/plex-sans-600.woff2) format("woff2"); font-weight: 600; font-display: swap; }
+@font-face { font-family: "Plex Mono"; src: url(/vendor/fonts/plex-mono-400.woff2) format("woff2"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Plex Mono"; src: url(/vendor/fonts/plex-mono-500.woff2) format("woff2"); font-weight: 500; font-display: swap; }
+
+:root {
+  --paper: #f6f6f4; --sheet: #ffffff; --well: #eeefec; --rule: #d9dad6; --rule-strong: #b9bbb5;
+  --ink: #1b1e22; --ink-2: #4a4f56; --ink-3: #7c8189;
+  --blue: #1f4fa3; --blue-ink: #ffffff; --blue-wash: #e6ecf6;
+  --pass: #2e7d32; --warn: #a3620a; --fail: #b3261e;
+  --sans: "Plex Sans", system-ui, sans-serif; --mono: "Plex Mono", ui-monospace, monospace;
+  --r: 3px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #17191c; --sheet: #1e2124; --well: #25282c; --rule: #33373c; --rule-strong: #4a4f56;
+    --ink: #e6e7e9; --ink-2: #b4b8be; --ink-3: #868b93;
+    --blue: #6f9be6; --blue-ink: #0d1726; --blue-wash: #1f2b3d;
+    --pass: #6cbf73; --warn: #d9a148; --fail: #ec7a72;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--paper); color: var(--ink); font: 14px/1.45 var(--sans); overflow: hidden; }
+a { color: var(--blue); }
+.num, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.dim { color: var(--ink-3); } .sub { color: var(--ink-2); }
+.hidden { display: none !important; }
+button, input, select, textarea { font: inherit; color: inherit; }
+
+.btn { border: 1px solid var(--rule-strong); background: var(--sheet); border-radius: var(--r); padding: 5px 12px;
+       cursor: pointer; text-decoration: none; color: var(--ink); display: inline-flex; align-items: center; gap: 6px;
+       white-space: nowrap; }
+.btn:hover { border-color: var(--ink-3); }
+.btn.primary { background: var(--blue); border-color: var(--blue); color: var(--blue-ink); }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+.btn.small { padding: 2px 8px; font-size: 13px; }
+select, input[type=text], textarea { border: 1px solid var(--rule-strong); background: var(--sheet); border-radius: var(--r);
+       padding: 5px 8px; outline: none; }
+select:focus, input:focus, textarea:focus { border-color: var(--blue); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+
+/* state words with a small square mark */
+.state { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.state::before { content: ""; width: 7px; height: 7px; background: currentColor; flex: none; }
+.s-running { color: var(--blue); } .s-queued, .s-stopped { color: var(--ink-3); } .s-done { color: var(--ink); }
+.s-failed, .s-interrupted { color: var(--fail); }
+.ok { color: var(--pass); } .warn { color: var(--warn); } .bad { color: var(--fail); }
+
+/* top bar */
+#bar { height: 44px; display: flex; align-items: center; gap: 18px; padding: 0 16px; border-bottom: 1px solid var(--rule);
+       background: var(--sheet); }
+#bar .mark { font-weight: 600; color: var(--ink); text-decoration: none; letter-spacing: -.01em; }
+#bar nav a { color: var(--ink-2); text-decoration: none; padding: 12px 0; border-bottom: 2px solid transparent; }
+#bar nav a.on { color: var(--ink); border-bottom-color: var(--blue); }
+#bar .grow { flex: 1; }
+main { height: calc(100% - 44px); }
+
+/* ---------------------------------------------------------------- jobs page */
+#jobs { height: 100%; overflow-y: auto; }
+.page { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+.intake { margin: 16px 0 28px; background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r); }
+.drop { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px dashed var(--rule-strong); }
+.drop.over { background: var(--blue-wash); }
+.intake .files:empty { display: none; }
+.intake .files { padding: 4px 16px; border-bottom: 1px solid var(--rule); }
+.intake .file { display: flex; gap: 12px; align-items: center; padding: 4px 0; }
+.intake .opts { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 16px; }
+.intake .opts label { color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.intake .opts input[type=text] { width: 320px; max-width: 100%; }
+
+table.grid { width: 100%; border-collapse: collapse; background: var(--sheet); border: 1px solid var(--rule); }
+table.grid th { text-align: left; font-weight: 500; color: var(--ink-2); font-size: 12.5px; padding: 7px 10px;
+                border-bottom: 1px solid var(--rule-strong); background: var(--well); white-space: nowrap; }
+table.grid td { padding: 7px 10px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+table.grid tr.row { cursor: pointer; } table.grid tr.row:hover td { background: var(--blue-wash); }
+table.grid td.r, table.grid th.r { text-align: right; }
+table.grid td.name { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.empty { padding: 28px; text-align: center; color: var(--ink-3); background: var(--sheet); border: 1px solid var(--rule); }
+
+/* ---------------------------------------------------------------- job page */
+#job { height: 100%; display: grid; grid-template-columns: minmax(360px, 420px) 1fr; }
+#side { border-right: 1px solid var(--rule); background: var(--sheet); display: grid; grid-template-rows: 1fr auto; min-height: 0;
+        min-width: 0; overflow: hidden; }
+#side select { max-width: 100%; }
+#sidescroll { overflow-y: auto; }
+.block { padding: 14px 16px; border-bottom: 1px solid var(--rule); }
+.block h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+.tblock { display: grid; grid-template-columns: auto minmax(0, 1fr); border: 1px solid var(--rule-strong); border-radius: var(--r); }
+.tblock > div { padding: 5px 9px; border-bottom: 1px solid var(--rule); }
+.tblock > div:nth-child(odd) { color: var(--ink-3); font-size: 12.5px; border-right: 1px solid var(--rule); }
+.tblock > div:nth-last-child(-n+2) { border-bottom: 0; }
+.tblock .fname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.verdict p { margin: 0 0 6px; } .verdict p:last-child { margin: 0; }
+
+.steps { margin: 0 -16px; }
+.step { border-top: 1px solid var(--rule); }
+.step:first-child { border-top: 0; }
+.step .row { display: grid; grid-template-columns: 16px 1fr auto auto; gap: 8px; align-items: baseline; padding: 6px 16px;
+             cursor: pointer; }
+.step .row:hover { background: var(--well); }
+.step .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.step.done .t { color: var(--ink-2); }
+.step.failed .t, .step.stopped .t { color: var(--fail); }
+.step .m { font-size: 12.5px; color: var(--ink-3); text-align: right; }
+.step .g { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+.step.running .g { color: var(--blue); }
+.step .details { display: none; padding: 2px 16px 8px 40px; font-size: 12.5px; color: var(--ink-2); }
+.step.open .details { display: block; }
+.step .details div { padding: 1px 0; }
+.step.running .row { position: relative; }
+.step.running .row::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 30%;
+                            background: var(--blue); animation: track 1.6s ease-in-out infinite; }
+@keyframes track { 0% { left: 0; width: 10%; } 50% { left: 45%; width: 35%; } 100% { left: 100%; width: 0; } }
+@media (prefers-reduced-motion: reduce) { .step.running .row::after { animation: none; width: 100%; opacity: .4; } }
+.spinner { width: 10px; height: 10px; border: 1.5px solid var(--rule-strong); border-top-color: var(--blue); border-radius: 50%;
+           display: inline-block; animation: spin .8s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+details.raw summary { cursor: pointer; color: var(--ink-3); font-size: 12.5px; }
+details.raw pre { margin: 8px 0 0; max-height: 260px; overflow: auto; background: var(--well); border: 1px solid var(--rule);
+                  padding: 8px; font: 11.5px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; }
+
+.qa .q { font-weight: 600; margin-top: 12px; }
+.qa .q:first-of-type { margin-top: 0; }
+.qa .a p { margin: 4px 0 6px; } .qa .a ul { margin: 4px 0 6px; padding-left: 18px; }
+.qa code { font-family: var(--mono); font-size: 12.5px; background: var(--well); padding: 0 3px; }
+#ask { border-top: 1px solid var(--rule); padding: 10px 16px 12px; background: var(--sheet); }
+#ask textarea { width: 100%; resize: none; min-height: 38px; max-height: 160px; display: block; }
+#ask .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+
+#work { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto 1fr; }
+.tabs { display: flex; align-items: flex-end; gap: 20px; padding: 0 16px; border-bottom: 1px solid var(--rule); background: var(--sheet);
+        min-height: 41px; }
+.tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 0 9px; cursor: pointer; color: var(--ink-2); }
+.tabs button.on { color: var(--ink); border-bottom-color: var(--blue); }
+.tabs button:disabled { color: var(--ink-3); opacity: .6; cursor: default; }
+.tabs .grow { flex: 1; } .tabs .tools { display: flex; gap: 8px; align-items: center; padding-bottom: 6px; }
+.pane { position: relative; min-height: 0; }
+#pdf { width: 100%; height: 100%; border: 0; background: var(--well); display: block; }
+#view { position: absolute; inset: 0; background: var(--well); }
+#view canvas { display: block; width: 100% !important; height: 100% !important; }
+#modelline { position: absolute; left: 12px; bottom: 10px; background: var(--sheet); border: 1px solid var(--rule);
+             border-radius: var(--r); padding: 3px 8px; font-size: 12.5px; }
+#modelline:empty { display: none; }
+.note { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-3); padding: 24px; text-align: center; }
+
+#proj { overflow-y: auto; padding: 12px 16px 24px; }
+.ptools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+.seg { display: inline-flex; border: 1px solid var(--rule-strong); border-radius: var(--r); overflow: hidden; }
+.seg button { border: 0; background: var(--sheet); padding: 4px 10px; cursor: pointer; color: var(--ink-2); }
+.seg button + button { border-left: 1px solid var(--rule-strong); }
+.seg button.on { background: var(--ink); color: var(--paper); }
+.pview { background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r); margin-bottom: 12px; }
+.pview .ph { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline; padding: 8px 12px; border-bottom: 1px solid var(--rule); }
+.pview .ph b { font-weight: 600; }
+.pview .metrics { display: flex; gap: 16px; margin-left: auto; font-size: 12.5px; }
+.pview .imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--rule); }
+.pview .imgs.one { grid-template-columns: 1fr; }
+.pview figure { margin: 0; background: #fff; position: relative; }
+.pview figure img { width: 100%; display: block; cursor: zoom-in; }
+.pview figcaption { position: absolute; left: 6px; top: 4px; font-size: 11.5px; color: #555; background: rgba(255,255,255,.85); padding: 0 4px; }
+.pview .dims { padding: 7px 12px; font-size: 12.5px; border-top: 1px solid var(--rule); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.legend { font-size: 12.5px; color: var(--ink-2); display: flex; gap: 12px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 10px; height: 3px; margin-right: 5px; vertical-align: middle; }
+dialog { border: 1px solid var(--rule-strong); border-radius: var(--r); padding: 0; background: var(--sheet); color: var(--ink);
+         max-width: 92vw; max-height: 92vh; }
+dialog::backdrop { background: rgba(10,12,14,.55); }
+dialog .dh { display: flex; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--rule); gap: 8px; }
+dialog img { display: block; max-width: 90vw; max-height: 80vh; background: #fff; }
+
+@media (max-width: 900px) {
+  body { overflow: auto; } main { height: auto; }
+  #job { grid-template-columns: 1fr; } #side { border-right: 0; border-bottom: 1px solid var(--rule); }
+  #work { height: 70vh; }
+  .intake .opts input[type=text] { width: 100%; }
+}
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three.module.js", "three/addons/controls/OrbitControls.js": "/vendor/OrbitControls.js" } }
+</script>
+</head>
+<body>
+<header id="bar">
+  <a class="mark" href="#/">Draw2CAD</a>
+  <nav><a href="#/" id="nav-jobs">Jobs</a></nav>
+  <span class="grow"></span>
+  <span class="dim" id="barnote"></span>
+</header>
+<main>
+  <!-- ================================================================ jobs -->
+  <section id="jobs" class="hidden">
+    <div class="page">
+      <h1>Jobs</h1>
+      <div class="sub">Each drawing is read, modelled and checked against its own views. Results come back as STEP files.</div>
+      <div class="intake" id="intake">
+        <div class="drop" id="drop">
+          <button class="btn" id="pick">Add drawings…</button>
+          <span class="sub">or drop PDF files here. Several at once run side by side.</span>
+          <input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
+        </div>
+        <div class="files" id="files"></div>
+        <div class="opts">
+          <label>Model <select id="model"></select></label>
+          <label>Note <input type="text" id="note" placeholder="Optional, kept with each job"></label>
+          <span style="flex:1"></span>
+          <button class="btn primary" id="start" disabled>Start</button>
+        </div>
+      </div>
+      <div id="jobtable"></div>
+    </div>
+  </section>
+
+  <!-- ================================================================ one job -->
+  <section id="job" class="hidden">
+    <aside id="side">
+      <div id="sidescroll">
+        <div class="block">
+          <div class="tblock" id="tblock"></div>
+          <div class="actions">
+            <a class="btn primary" id="dl" aria-disabled="true">Download STEP</a>
+            <button class="btn" id="stop">Stop</button>
+          </div>
+        </div>
+        <div class="block verdict hidden" id="verdict"></div>
+        <div class="block">
+          <h2>Steps <span class="dim num" id="stepcount"></span></h2>
+          <div class="steps" id="steps"></div>
+          <details class="raw" id="raw"><summary>Full log</summary><pre></pre></details>
+        </div>
+        <div class="block qa hidden" id="qa"></div>
+      </div>
+      <div id="ask" class="hidden">
+        <textarea id="askinput" rows="1" placeholder="Ask about this part: a size, a hole, what was checked"></textarea>
+        <div class="row"><select id="askmodel"></select><span style="flex:1"></span>
+          <button class="btn primary small" id="asksend" disabled>Ask</button></div>
+      </div>
+    </aside>
+    <section id="work">
+      <div class="tabs">
+        <button data-tab="drawing" class="on">Drawing</button>
+        <button data-tab="model" disabled>3D model</button>
+        <button data-tab="proj" disabled>Projections</button>
+        <span class="grow"></span>
+        <span class="tools hidden" id="tools-model"><button class="btn small" id="reset">Reset view</button></span>
+      </div>
+      <div class="pane" id="pane-drawing"><iframe id="pdf" title="Drawing"></iframe></div>
+      <div class="pane hidden" id="pane-model"><div id="view"></div><div id="modelline" class="num"></div></div>
+      <div class="pane hidden" id="proj"></div>
+    </section>
+  </section>
+</main>
+<dialog id="zoom"><div class="dh"><b id="zoomtitle"></b><span style="flex:1"></span><button class="btn small" id="zoomclose">Close</button></div><img id="zoomimg" alt=""></dialog>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || r.statusText);
+  return d;
+}
+const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+const FINISHED = ["done", "failed", "stopped", "interrupted"];
+const STATE = { queued: "Waiting", running: "Running", done: "Finished", failed: "Failed", stopped: "Stopped", interrupted: "Interrupted" };
+let MODELS = [], DEFAULT = "";
+const modelName = (id) => (MODELS.find((m) => m.id === id) || {}).name || (id || "").split("/").pop() || "–";
+
+function dur(s) {
+  if (s == null) return "–";
+  s = Math.round(s);
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m} min ${String(s % 60).padStart(2, "0")} s` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+const money = (c) => c == null ? "–" : `$${c.toFixed(c < 0.01 ? 4 : 3)}`;
+const pct = (x) => x == null ? "–" : `${Math.round(x * 100)}%`;
+const level = (x) => x == null ? "" : x >= 0.95 ? "ok" : x >= 0.8 ? "warn" : "bad";
+function md(text) {  // paragraphs, lists, **bold**, `code`; everything escaped first
+  const inline = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
+  const item = /^\s*(?:[-*•]|\d+[.)]) /;
+  return text.trim().split(/\n{2,}/).map((block) => {
+    let html = "", para = [], list = [];
+    const flush = () => {
+      if (para.length) html += `<p>${para.map(inline).join("<br>")}</p>`;
+      if (list.length) html += "<ul>" + list.map((l) => `<li>${inline(l.replace(item, ""))}</li>`).join("") + "</ul>";
+      para = []; list = [];
+    };
+    for (const line of block.split("\n")) {
+      if (item.test(line)) { if (para.length) flush(); list.push(line); } else { if (list.length) flush(); para.push(line); }
+    }
+    flush();
+    return html;
+  }).join("");
+}
+function resultText(j) {
+  const r = j.result;
+  if (!r) return j.status === "running" || j.status === "queued" ? "–" : "No part";
+  if (r.status === "failed") return "No part";
+  const what = r.status === "partial" ? "Part, incomplete" : "Part built";
+  return r.validated ? `${what}, checked` : `${what}, not checked`;
+}
+function fillModels(sel, key, withNotes = true) {
+  const cur = store.get(key);
+  sel.innerHTML = MODELS.map((m) => `<option value="${esc(m.id)}">${esc(m.name)}${withNotes ? ` (${esc(m.note)})` : ""}</option>`).join("");
+  sel.value = MODELS.some((m) => m.id === cur) ? cur : DEFAULT;
+  sel.onchange = () => store.set(key, sel.value);
+}
+
+// ================================================================== routing
+let current = null;
+function route() {
+  const m = location.hash.match(/^#\/job\/([\w-]+)(?:\/(drawing|model|proj))?/);
+  $("nav-jobs").classList.toggle("on", !m);
+  if (!m) return showJobs();
+  if (current === m[1]) { if (m[2]) setTab(m[2]); return; }
+  openJob(m[1], m[2]);
+}
+addEventListener("hashchange", route);
+
+// ================================================================== jobs page
+let picked = [], listTimer = null;
+$("pick").onclick = () => $("file").click();
+$("file").onchange = (e) => { addFiles([...e.target.files]); e.target.value = ""; };
+const drop = $("drop");
+for (const ev of ["dragenter", "dragover"]) document.addEventListener(ev, (e) => {
+  if ($("jobs").classList.contains("hidden")) return;
+  e.preventDefault(); drop.classList.add("over");
+});
+document.addEventListener("dragleave", (e) => { if (!e.relatedTarget) drop.classList.remove("over"); });
+document.addEventListener("drop", (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+  if (!$("jobs").classList.contains("hidden")) addFiles([...e.dataTransfer.files]);
+});
+
+function addFiles(files) {
+  for (const f of files) {
+    if (!/\.pdf$/i.test(f.name) && f.type !== "application/pdf") { alert(`${f.name} is not a PDF drawing.`); continue; }
+    picked.push(f);
+  }
+  drawPicked();
+}
+function drawPicked() {
+  $("files").innerHTML = picked.map((f, i) => `<div class="file"><span>${esc(f.name)}</span>
+     <span class="dim num">${(f.size / 1024).toFixed(0)} KB</span><span style="flex:1"></span>
+     <button class="btn small" data-i="${i}">Remove</button></div>`).join("");
+  for (const b of $("files").querySelectorAll("button")) b.onclick = () => { picked.splice(+b.dataset.i, 1); drawPicked(); };
+  $("start").disabled = !picked.length;
+  $("start").textContent = picked.length > 1 ? `Start ${picked.length} jobs` : "Start";
+}
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  const files = picked.slice(); let last = null;
+  for (const f of files) {
+    try {
+      last = await api("/api/jobs", { method: "POST", body: f, headers: { "X-Filename": encodeURIComponent(f.name),
+        "X-Prompt": encodeURIComponent($("note").value.trim()), "X-Model": $("model").value } });
+      picked.splice(picked.indexOf(f), 1);
+    } catch (err) { alert(`${f.name}: ${err.message}`); }
+  }
+  drawPicked(); $("note").value = "";
+  if (files.length === 1 && last) location.hash = `#/job/${last.id}`; else loadJobs();
+};
+
+function showJobs() {
+  current = null; stopJob();
+  $("job").classList.add("hidden"); $("jobs").classList.remove("hidden");
+  $("barnote").textContent = "";
+  loadJobs();
+}
+async function loadJobs() {
+  clearTimeout(listTimer);
+  if ($("jobs").classList.contains("hidden")) return;
+  let jobs = [];
+  try { jobs = await api("/api/jobs"); } catch { return; }
+  const box = $("jobtable");
+  if (!jobs.length) box.innerHTML = '<div class="empty">No jobs yet. Add a drawing above.</div>';
+  else box.innerHTML = `<table class="grid"><thead><tr><th>Drawing</th><th>State</th><th>Result</th><th class="r">Matches drawing</th>
+      <th class="r">Open issues</th><th class="r">Time</th><th class="r">Cost</th><th>Model</th><th>Started</th></tr></thead><tbody>
+    ${jobs.map((j) => {
+      const r = j.result || {};
+      return `<tr class="row" data-id="${esc(j.id)}"><td class="name" title="${esc(j.name)}">${esc(j.name)}</td>
+        <td><span class="state s-${j.status}">${j.status === "running" ? '<span class="spinner"></span> ' : ""}${STATE[j.status] || j.status}</span></td>
+        <td>${resultText(j)}</td>
+        <td class="r num ${r.validated ? level(r.drawn_covered) : ""}">${r.validated ? pct(r.drawn_covered) : "–"}</td>
+        <td class="r num ${r.high_issues_left ? "bad" : ""}">${r.high_issues_left ?? "–"}</td>
+        <td class="r num">${r.seconds != null ? dur(r.seconds) : "–"}</td>
+        <td class="r num">${money(j.cost_usd)}</td>
+        <td class="sub">${esc(modelName(j.model))}</td>
+        <td class="num dim">${esc(j.created.replace("T", " ").slice(5, 16))}</td></tr>`;
+    }).join("")}</tbody></table>`;
+  for (const tr of box.querySelectorAll("tr.row")) tr.onclick = () => location.hash = `#/job/${tr.dataset.id}`;
+  if (jobs.some((j) => !FINISHED.includes(j.status))) listTimer = setTimeout(loadJobs, 3000);
+}
+
+// ================================================================== one job
+const J = {};
+function stopJob() { clearTimeout(J.timer); clearTimeout(J.projTimer); J.id = null; }
+
+async function openJob(id, tab) {
+  stopJob();
+  current = id;
+  Object.assign(J, { id, job: null, open: new Set(), logOffset: 0, log: "", finished: false, wantTab: tab, modelLoaded: false,
+                     proj: null, projLoaded: false });
+  $("jobs").classList.add("hidden"); $("job").classList.remove("hidden");
+  $("steps").innerHTML = ""; $("raw").querySelector("pre").textContent = ""; $("raw").open = false;
+  $("verdict").classList.add("hidden"); $("qa").classList.add("hidden"); $("ask").classList.add("hidden");
+  $("qa").innerHTML = ""; $("proj").innerHTML = "";
+  $("pdf").src = `/api/jobs/${id}/drawing#view=FitH`;
+  clearModel();
+  for (const b of document.querySelectorAll(".tabs [data-tab]")) b.disabled = b.dataset.tab !== "drawing";
+  setTab("drawing");
+  await tick();
+}
+
+async function tick() {
+  const id = J.id;
+  try {
+    const [st, lg] = await Promise.all([api(`/api/jobs/${id}/steps`), api(`/api/jobs/${id}/log?offset=${J.logOffset}`)]);
+    if (id !== J.id) return;
+    J.log += lg.text; J.logOffset = lg.offset; J.job = st.job;
+    render(st);
+    if (FINISHED.includes(st.job.status) && !J.finished) await finished();
+  } catch (err) { console.warn(err); }
+  if (id === J.id && !FINISHED.includes(J.job?.status)) J.timer = setTimeout(tick, 1500);
+}
+
+function render(st) {
+  const j = st.job, r = j.result || {};
+  $("barnote").textContent = j.name;
+  $("tblock").innerHTML = `
+    <div>Drawing</div><div class="fname"><a href="/api/jobs/${esc(j.id)}/drawing" target="_blank" title="${esc(j.name)}">${esc(j.name)}</a></div>
+    <div>State</div><div><span class="state s-${j.status}">${STATE[j.status] || j.status}</span></div>
+    <div>Result</div><div>${resultText(j)}</div>
+    <div>Model</div><div>${esc(modelName(j.model))}</div>
+    <div>Time</div><div class="num">${dur(r.seconds ?? st.seconds)}</div>
+    <div>Cost</div><div class="num">${money(j.cost_usd)}</div>
+    <div>Started</div><div class="num">${esc(j.created.replace("T", " "))}</div>
+    ${j.prompt ? `<div>Note</div><div>${esc(j.prompt)}</div>` : ""}`;
+  $("stop").classList.toggle("hidden", !["running", "queued"].includes(j.status));
+  const dl = $("dl");
+  dl.setAttribute("aria-disabled", j.has_step ? "false" : "true");
+  dl.href = j.has_step ? `/api/jobs/${j.id}/step` : "#";
+
+  // steps: rows updated in place, so open rows stay open
+  const box = $("steps");
+  $("stepcount").textContent = st.steps.length ? st.steps.length : "";
+  if (!st.steps.length) { box.innerHTML = `<div class="dim" style="padding:2px 16px 6px">${j.status === "queued" ? "Waiting for a free slot." : "Starting."}</div>`; }
+  else if (box.querySelector(":scope > .dim")) box.innerHTML = "";
+  st.steps.forEach((s, i) => {
+    let el = box.children[i];
+    if (!el) {
+      el = document.createElement("div");
+      el.innerHTML = `<div class="row"><span class="g"></span><span class="t"></span><span class="m num"></span><span class="m num c"></span></div><div class="details"></div>`;
+      el.querySelector(".row").onclick = () => { J.open.has(i) ? J.open.delete(i) : J.open.add(i); el.classList.toggle("open"); };
+      box.appendChild(el);
+    }
+    el.className = `step ${s.status}${J.open.has(i) ? " open" : ""}`;
+    el.querySelector(".g").innerHTML = s.status === "running" ? '<span class="spinner"></span>' : s.status === "done" ? "✓" : "✕";
+    el.querySelector(".t").textContent = s.title;
+    el.querySelector(".t").title = s.title;
+    el.querySelector(".m").textContent = s.seconds != null ? dur(s.seconds) : "";
+    el.querySelector(".c").textContent = s.cost ? money(s.cost) : "";
+    el.querySelector(".details").innerHTML = s.details.length ? s.details.map((d) => `<div>${esc(d)}</div>`).join("") : "<div>Nothing recorded yet.</div>";
+  });
+  const pre = $("raw").querySelector("pre");
+  if (pre.textContent.length !== J.log.length) { pre.textContent = J.log; if ($("raw").open) pre.scrollTop = pre.scrollHeight; }
+}
+
+$("stop").onclick = async () => {
+  if (!confirm("Stop this job? What it has done so far is kept.")) return;
+  try { await api(`/api/jobs/${J.id}/stop`, { method: "POST" }); } catch (err) { alert(err.message); }
+};
+
+async function finished() {
+  J.finished = true;
+  const j = J.job;
+  $("verdict").innerHTML = verdictHtml(j);
+  $("verdict").classList.remove("hidden");
+  if (j.has_step) {
+    for (const b of document.querySelectorAll(".tabs [data-tab]")) b.disabled = false;
+    setTab(J.wantTab && J.wantTab !== "drawing" ? J.wantTab : "model");
+  }
+  if (j.run_dir) {
+    $("ask").classList.remove("hidden");
+    let history = [];
+    try { history = await api(`/api/jobs/${J.id}/chat`); } catch {}
+    for (let i = 0; i < history.length; i += 2) addQA(history[i]?.content, history[i + 1]?.content);
+  }
+}
+
+function verdictHtml(j) {
+  const r = j.result;
+  if (!r) return `<h2>Assessment</h2><p>${j.status === "stopped" ? "Stopped before a result. The steps so far are kept." : "The run ended without a result. See the full log."}</p>`;
+  const lines = [];
+  if (r.status === "failed") lines.push(`<p class="bad">No valid part could be built.</p>`);
+  else if (r.validated) {
+    const issues = r.high_issues_left || 0, cov = r.drawn_covered;
+    const trust = issues === 0 && cov != null && cov >= 0.95;
+    lines.push(`<p><span class="${level(cov)}">Matches ${pct(cov)} of the drawn lines</span> in the measured views, with
+      <span class="${issues ? "bad" : "ok"}">${issues ? `${issues} serious issue${issues > 1 ? "s" : ""} open` : "no serious issue open"}</span>.</p>`);
+    lines.push(trust ? `<p>Spot-check the projections before machining.</p>`
+                     : `<p>Check the areas the projections mark before using this part.</p>`);
+  } else {
+    lines.push(`<p class="warn">Built but not measured against the drawing. Check it against the drawing by eye.</p>`);
+  }
+  if (r.status === "partial") lines.push(`<p class="warn">Some features could not be built; see the steps.</p>`);
+  return `<h2>Assessment</h2>${lines.join("")}`;
+}
+
+// ------------------------------------------------------------------ questions
+const askinput = $("askinput");
+askinput.addEventListener("input", () => {
+  askinput.style.height = "auto"; askinput.style.height = Math.min(askinput.scrollHeight, 160) + "px";
+  $("asksend").disabled = !askinput.value.trim();
+});
+askinput.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } });
+$("asksend").onclick = ask;
+function addQA(q, a) {
+  const box = $("qa");
+  if (!box.querySelector("h2")) box.innerHTML = "<h2>Questions</h2>";
+  box.classList.remove("hidden");
+  const qe = document.createElement("div"); qe.className = "q"; qe.textContent = q;
+  const ae = document.createElement("div"); ae.className = "a";
+  ae.innerHTML = a == null ? '<span class="spinner"></span>' : md(a);
+  box.append(qe, ae);
+  $("sidescroll").scrollTop = $("sidescroll").scrollHeight;
+  return ae;
+}
+async function ask() {
+  const q = askinput.value.trim();
+  if (!q || askinput.disabled) return;
+  askinput.value = ""; askinput.disabled = true; $("asksend").disabled = true;
+  const a = addQA(q, null);
+  try {
+    const h = await api(`/api/jobs/${J.id}/chat`, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                   body: JSON.stringify({ message: q, model: $("askmodel").value }) });
+    a.innerHTML = md(h[h.length - 1].content);
+  } catch (err) { a.textContent = `No answer: ${err.message}`; }
+  askinput.disabled = false; askinput.focus();
+  $("sidescroll").scrollTop = $("sidescroll").scrollHeight;
+}
+
+// ------------------------------------------------------------------ tabs
+for (const b of document.querySelectorAll(".tabs [data-tab]")) b.onclick = () => {
+  if (!b.disabled) location.hash = `#/job/${J.id}/${b.dataset.tab}`;
+};
+function setTab(tab) {
+  const btn = document.querySelector(`.tabs [data-tab="${tab}"]`);
+  if (!btn || btn.disabled) tab = "drawing";
+  for (const b of document.querySelectorAll(".tabs [data-tab]")) b.classList.toggle("on", b.dataset.tab === tab);
+  $("pane-drawing").classList.toggle("hidden", tab !== "drawing");
+  $("pane-model").classList.toggle("hidden", tab !== "model");
+  $("proj").classList.toggle("hidden", tab !== "proj");
+  $("tools-model").classList.toggle("hidden", tab !== "model");
+  if (tab === "model") { resize(); if (!J.modelLoaded) loadModel(); }
+  if (tab === "proj" && !J.projLoaded) loadProjections();
+}
+
+// ------------------------------------------------------------------ projections
+const P = { mode: store.get("d2c-proj-mode") || "side" };
+async function loadProjections(set) {
+  const id = J.id;
+  clearTimeout(J.projTimer);
+  if (!J.proj) $("proj").innerHTML = '<div class="dim"><span class="spinner"></span> Loading projections…</div>';
+  try {
+    const d = await api(`/api/jobs/${id}/projections${set ? `?set=${encodeURIComponent(set)}` : ""}`);
+    if (id !== J.id) return;
+    J.proj = d; J.projLoaded = true;
+    drawProjections();
+    if (d.running) J.projTimer = setTimeout(() => loadProjections(), 2000);
+  } catch (err) { $("proj").innerHTML = `<div class="bad">${esc(err.message)}</div>`; }
+}
+const setName = (s) => s.startsWith("validation/round_") ? `Pipeline check, round ${s.split("_").pop()}`
+                    : `Projection run at ${s.split("/").pop().replace(/^\d{8}-(\d\d)(\d\d)(\d\d)$/, "$1:$2")}`;
+function drawProjections() {
+  const d = J.proj, pane = $("proj");
+  let html = `<div class="ptools">`;
+  if (d.sets.length) html += `<select id="projset">${d.sets.map((s) => `<option value="${esc(s)}" ${s === d.set ? "selected" : ""}>${esc(setName(s))}</option>`).join("")}</select>
+      <span class="${d.matches_model ? "dim" : "warn"}">${d.matches_model ? "Current model" : "An earlier model"}</span>`;
+  html += `<span style="flex:1"></span>
+    <span class="seg"><button data-mode="side" class="${P.mode === "side" ? "on" : ""}">Side by side</button><button data-mode="overlay" class="${P.mode === "overlay" ? "on" : ""}">Overlay</button></span>
+    <button class="btn" id="runproj" ${!d.available || d.running ? "disabled" : ""}>${d.running ? '<span class="spinner"></span> Projecting' : "Run projections"}</button></div>`;
+  if (P.mode === "overlay" && d.views.length) html += `<div class="legend" style="margin:-4px 0 10px"><span><i style="background:#000"></i>drawing</span><span><i style="background:#e33"></i>model</span><span><i style="background:orange"></i>drawn, missing in model</span><span><i style="background:#a3c"></i>in model, not drawn</span></div>`;
+  if (!d.available) html += `<p class="sub">Projections need the drawing's views as vector PDF. This drawing is a scan, which is not supported yet.</p>`;
+  if (d.error) html += `<p class="bad">${esc(d.error)}</p>`;
+  if (!d.sets.length && d.available && !d.running) html += `<p class="sub">No projections yet. <b>Run projections</b> compares the model with every view of the drawing.</p>`;
+  html += d.views.map(viewHtml).join("");
+  pane.innerHTML = html;
+  pane.querySelector("#projset")?.addEventListener("change", (e) => loadProjections(e.target.value));
+  for (const b of pane.querySelectorAll("[data-mode]")) b.onclick = () => { P.mode = b.dataset.mode; store.set("d2c-proj-mode", P.mode); drawProjections(); };
+  pane.querySelector("#runproj")?.addEventListener("click", runProjections);
+  for (const img of pane.querySelectorAll("figure img")) img.onclick = () => {
+    $("zoomtitle").textContent = img.dataset.title; $("zoomimg").src = img.src; $("zoom").showModal();
+  };
+}
+function viewHtml(v) {
+  const m = v.metrics || {}, ax = v.axes || {};
+  const fig = (key, cap) => v.images[key] ? `<figure><img loading="lazy" src="${esc(v.images[key])}" data-title="${esc(v.label)}: ${cap}" alt="${esc(cap)}"><figcaption>${cap}</figcaption></figure>` : "";
+  const imgs = !Object.keys(v.images).length ? `<div class="sub" style="padding:10px 12px">Not compared: ${esc(v.note || "this view could not be projected")}</div>`
+             : P.mode === "overlay" ? `<div class="imgs one">${fig("overlay", "Overlay")}</div>`
+             : `<div class="imgs">${fig("drawing", "Drawing")}${fig("model", "Model")}</div>`;
+  const dims = v.callouts.map((c) => `<span class="${c.ok ? "ok" : "bad"}" title="${esc(c.detail || "")}">${c.ok ? "✓" : "✕"} ${esc(c.text)}</span>`).join("");
+  return `<div class="pview"><div class="ph"><b>${esc(v.label)}</b>
+      <span class="dim">${ax.looking_along ? `looking along ${esc(ax.looking_along)}, right ${esc(ax.horizontal)}, up ${esc(ax.vertical)}` : ""}</span>
+      <span class="metrics num"><span class="${level(m.drawn_covered)}" title="Share of the drawn lines the model matches">drawn ${pct(m.drawn_covered)}</span>
+      <span class="${level(m.model_covered)}" title="Share of the model's lines that are on the drawing">model ${pct(m.model_covered)}</span>
+      ${m.drawn_to_model_p95_mm != null ? `<span class="sub" title="95% of drawn lines are this close to the model">±${m.drawn_to_model_p95_mm} mm</span>` : ""}
+      ${v.missing ? `<span class="warn">${v.missing} missing</span>` : ""}${v.extra ? `<span class="warn">${v.extra} extra</span>` : ""}</span></div>
+    ${imgs}${dims ? `<div class="dims"><span class="dim">Dimensions</span>${dims}</div>` : ""}</div>`;
+}
+async function runProjections() {
+  try {
+    J.proj = await api(`/api/jobs/${J.id}/projections`, { method: "POST" });
+    drawProjections();
+    J.projTimer = setTimeout(() => loadProjections(), 2000);
+  } catch (err) { alert(err.message); }
+}
+$("zoomclose").onclick = () => $("zoom").close();
+
+// ------------------------------------------------------------------ 3D view
+const view = $("view");
+let renderer = null;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(devicePixelRatio);
+  view.appendChild(renderer.domElement);
+} catch {
+  view.innerHTML = '<div class="note">This browser cannot show 3D (WebGL is off). Download the STEP to open the part in your CAD software.</div>';
+}
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100000);
+camera.up.set(0, 0, 1);
+const controls = renderer ? new OrbitControls(camera, renderer.domElement) : { update() {}, target: new THREE.Vector3() };
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x9098a0, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+scene.add(sun);
+let part = null;
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  if (!renderer || !w || !h) return;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view);
+(function loop() { if (!renderer) return; controls.update(); sun.position.copy(camera.position); renderer.render(scene, camera); requestAnimationFrame(loop); })();
+function clearModel() {
+  if (part) { scene.remove(part); part = null; }
+  $("modelline").textContent = "";
+}
+async function loadModel() {
+  const id = J.id;
+  J.modelLoaded = true;
+  $("modelline").innerHTML = '<span class="spinner"></span> Loading the model';
+  try {
+    const r = await api(`/api/jobs/${id}/model`);
+    if (id !== J.id || !r.key) return;
+    showMesh(r.mesh);
+    $("modelline").textContent = `${r.label} · ${r.mesh.size.map((v) => +v.toFixed(2)).join(" × ")} mm · ${Math.round(r.mesh.volume).toLocaleString()} mm³`;
+  } catch (err) { $("modelline").textContent = `Could not load the model: ${err.message}`; J.modelLoaded = false; }
+}
+function showMesh(mesh) {
+  if (part) scene.remove(part);
+  part = new THREE.Group();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(mesh.positions, 3));
+  geo.setIndex(mesh.indices);
+  geo.computeVertexNormals();
+  // machined-aluminium grey with dark edges, like a part on the bench
+  part.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xb8bcc2, metalness: 0.25, roughness: 0.5,
+                                                                 polygonOffset: true, polygonOffsetFactor: 1 })));
+  const lines = new THREE.LineBasicMaterial({ color: 0x22262b });
+  for (const e of mesh.edges) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(e, 3));
+    part.add(new THREE.Line(g, lines));
+  }
+  scene.add(part);
+  fit();
+}
+function fit() {
+  if (!part) return;
+  const box = new THREE.Box3().setFromObject(part);
+  const c = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3()).length() || 1;
+  controls.target.copy(c);
+  camera.position.copy(c).add(new THREE.Vector3(1, -1.25, 0.85).normalize().multiplyScalar(size * 1.6));
+  camera.near = size / 1000; camera.far = size * 100; camera.updateProjectionMatrix();
+}
+$("reset").onclick = fit;
+
+// ================================================================== boot
+try { const info = await api("/api/info"); MODELS = info.models; DEFAULT = info.default; } catch {}
+fillModels($("model"), "d2c-model");
+fillModels($("askmodel"), "d2c-chat-model", false);
+route();
+</script>
+</body>
+</html>

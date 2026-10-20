@@ -53,7 +53,7 @@ import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
-MODEL = "openai/gpt-6-luna"
+MODEL = os.getenv("D2C_MODEL") or "openai/gpt-6-luna"  # the web interface sets D2C_MODEL per job
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
