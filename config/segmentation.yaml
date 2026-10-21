@@ -1,0 +1,100 @@
+# Every tunable parameter of the local segmentation of scanned drawings, grouped by step, with today's values.
+# NOT WIRED IN YET: the code still uses its own constants. Each entry says where the value lives
+# (named = a module constant; inline = a number written in the function).
+
+render:
+  sheet_px: 3072                 # regions.SHEET_PX (named): long side of the rendered sheet; the scans are 3072 px, so 1:1
+  ink: 200                       # regions.INK (named): grey below which a pixel is ink (local_parts uses it too)
+
+views:                           # regions.view_crops (all inline): finding the views on the sheet
+  rule_length: 0.25              # a frame or title-block rule is a straight line at least this share of the sheet
+  frame_margin: 0.012            # share of the sheet skipped inside the frame (its zone strip)
+  merge_kernel: 0.02             # share of the sheet width: ink this close merges into one view (min 15 px)
+  min_view_area: 0.004           # share of the sheet area: smaller blobs are not views
+  min_stroke_px: 60              # a view has a stroke at least this long (or 12% of its size); else it is only text
+  min_stroke_share: 0.12
+
+regions:                         # regions.fill_regions: the closed regions of a view
+  close_kernel_px: 3             # inline: closing of the ink before filling (bridges 1 px breaks in lines)
+  min_area_px: 300               # argument min_area: smallest region kept ...
+  min_area_share: 0.005          # inline: ... or this share of the largest region, whichever is larger
+  touch_kernel_px: 7             # inline: two regions touch when their masks grown by this overlap ...
+  touch_min_px: 20               # inline: ... on at least this many pixels
+  shared_line_spread: 2.0        # inline: a shared boundary is one straight stroke when its spread is under this ...
+  shared_line_min_px: 15         # inline: ... and it is at least this long
+
+classify:                        # local_parts.segment
+  stroke_close_px: 3             # inline: closing of the ink before the paper flood fill
+  ring_px: 13                    # inline: ring round a region where its surroundings are read
+  enclosed_share: 0.9            # inline: a region is enclosed by another holding this share of its ring
+  text_paper_share: 0.5          # inline: a region with no neighbour and more paper than this round it is a letter
+  hole_max_host_share: 0.25      # inline: an isometric hole is smaller than this share of its face ...
+  hole_min_circularity: 0.3      # inline: ... and at least this round
+  face_width: 0.4                # local_parts.FACE_WIDTH (named): a face's inscribed width vs the widest region's
+  face_min_area_share: 0.03      # inline: ... and its area at least this share of the largest region
+
+view_kind:                       # local_parts.guess_kind (all inline): isometric or orthographic, when boxes come from view_crops
+  min_segment_px: 25             # only straight segments at least this long count
+  axis_tolerance_deg: 4          # a segment within this of horizontal or vertical is axis-aligned
+  orthographic_share: 0.6        # orthographic when at least this share of the length is axis-aligned
+
+circles:                         # local_parts.find_circles (all inline): holes on flat views
+  blur_kernel: 5
+  blur_sigma: 1.2
+  hough_min_dist: 4
+  hough_param1: 100
+  hough_param2: 10               # low on purpose: many candidates, kept only if they pass the checks below
+  min_radius_px: 4
+  max_radius_share: 0.12         # of the view's short side
+  prefilter_support: 0.6         # ink on at least this share of a candidate before it is refined
+  refine_steps: [1.0, 0.5]       # px steps of the hill climb on centre and radius ...
+  refine_iterations: 8           # ... at most this many moves per step
+  min_support: 0.9               # ink all round: at least this share of the circle on ink
+  outside_ring_px: [3, 4, 5]     # rings just outside the circle ...
+  max_outside_ink: 0.35          # ... must be mostly paper (a fillet's arc runs on into straight edges)
+  inside_radii: [0.45, 0.6, 0.75]
+  max_inside_ink: 0.25           # the inside is paper (crossed by centre lines at most)
+  host_ring_px: 6                # a hole belongs to the face round it, read this far outside the circle ...
+  host_min_share: 0.6            # ... when that face holds this share of the samples
+
+transfer:                        # local_parts.register / transfer / run: panels copied from a cleaner flat view
+  min_region_ratio: 2            # inline: only into a view with at least this many times the regions of the source
+  min_support: 0.85              # local_parts.MIN_SUPPORT (named): share of the outline that must land on ink
+  max_chance: 0.45               # local_parts.MAX_CHANCE (named): support allowed at random poses
+  outline_close_px: 15           # inline: closing of the panels' union before taking its outline
+  outline_points: 800            # inline: points sampled on the outline
+  scale_range: [0.4, 2.5]        # inline: scales tried ...
+  scale_steps: 60
+  fine_scale: [0.96, 1.04, 17]   # inline: refinement around the best scale ...
+  fine_rotation_deg: [-2, 2, 5]  # ... and rotation
+  ink_tolerance_px: 5            # inline: dilation of the ink when scoring support
+  hole_land_px: 4                # inline: every source hole must land within this of a circle ...
+  hole_radius_tolerance: 0.2     # ... of the same radius within this share
+  face_erode_px: 3               # inline: moved panel masks are eroded by this
+
+graph:                           # local_parts.face_graph / transfer
+  contact_kernel_px: 9           # inline: contact band between two faces (and between a face and its bend)
+
+matching:                        # local_parts.match_faces / match_holes
+  max_faces: 7                   # local_parts.MAX_FACES (named): largest faces per view tried in the search
+  cues:                          # local_parts.CUES (named): weights of the match score
+    holes: 3.0
+    neighbours: 2.0
+    hole_size: 1.0
+  hole_size_slope: 5             # inline: hole-size term = weight * max(-3, 1 - slope * |log ratio difference|)
+  unmatched_area_weight: 2       # inline: an unmatched face costs 1 + this * its area share
+  hole_order_size_weight: 0.5    # inline: weight of hole size when pairing holes within a face
+
+corrector:                       # src/corrector.py
+  notch_px: 7                    # corrector.NOTCH_PX (named): radius of the disc that fills notches (about 3.4 pt)
+  merge_close_px: 3              # inline: closing after a merge, to bridge the line between the pieces
+
+flat_blank:                      # src/flat_blank.py: the plan's blank snapped to the flat pattern
+  bridge_pt: 1.5                 # inline: panels this far apart (x2) still join into one blank
+  simplify_pt: 0.25              # inline: outline simplification
+  min_iou: 0.5                   # flat_blank.MIN_IOU (named): outline fit accepted above this (when no holes)
+  max_aspect: 0.08               # flat_blank.MAX_ASPECT (named): the two bounding-box scales may differ this much
+  hole_size_tolerance: 0.25      # inline: a drawn hole pairs with a planned one within this share of diameter
+  hole_scale_tolerance: 0.15     # inline: hole-based scale accepted within this of the outline-based one
+  max_hole_error_share: 0.1      # inline: hole fit accepted when holes land within this share of the blank's size
+  max_holes: 7                   # inline: the hole fit tries every pairing up to this many holes
