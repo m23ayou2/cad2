@@ -63,6 +63,9 @@ SCAN_BUILD_MODEL = os.getenv("D2C_SCAN_BUILD_MODEL") or "anthropic/claude-haiku-
 # A scan's budget for planning, building and validation (USD), on top of what the vision model costs: the reasoning
 # model costs far more per call than the vector path's, whose budget is agents/main.md's max_cost_usd.
 SCAN_MAX_COST_USD = float(os.getenv("D2C_SCAN_MAX_COST") or 3.0)
+# How a scan's parts are found: "local" = image processing segments and matches them and one MODEL call reviews
+# the groups (src/local_llm_match.py); "llm" = VISION_MODEL outlines and matches them (src/part_views.py).
+SCAN_PARTS = os.getenv("D2C_SCAN_PARTS") or "local"
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -791,6 +794,13 @@ def apply_extensions(tree: dict) -> list[str]:
 def save_plan(run: Run, result: dict) -> dict:
     for note in apply_extensions(result["feature_tree"]):
         log.info("  extension: %s", note)
+    if run.scanned:  # a sheet-metal blank: outline, bend lines and hole centres from the scan's own flat pattern
+        import flat_blank
+        notes = flat_blank.snap_blank(result["feature_tree"], run.dir / "parts")
+        for note in notes:
+            log.info("  %s", note)
+        if notes:
+            run.trace("blank_snapped", notes=notes)
     (run.dir / "feature_tree.json").write_text(json.dumps(result["feature_tree"], indent=2, ensure_ascii=False),
                                                encoding="utf-8")
     (run.dir / "plan.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -876,9 +886,21 @@ def plan_from_parts(run: Run) -> dict:
     llm.VISION_MODEL, llm.MODEL, part_views.VISION_MODEL = VISION_MODEL, MODEL, VISION_MODEL
     part_views.PARTS_METHOD = "direct"
     parts_dir = run.dir / "parts"
-    log.info("scanned drawing: reading the views with %s (views, parts, matching)", VISION_MODEL)
     t0 = time.monotonic()
-    part_views.run(run.drawing, run_dir=parts_dir)
+    if SCAN_PARTS == "local":
+        # the model only finds the views; their parts are segmented and matched locally (src/local_parts.py),
+        # and one call reviews the groups (src/local_llm_match.py)
+        from src.local_llm_match import scan_parts
+        log.info("scanned drawing: views found by %s, parts segmented and matched locally, groups reviewed by %s",
+                 VISION_MODEL, MODEL)
+        (parts_dir / "views").mkdir(parents=True, exist_ok=True)
+        with pymupdf.open(run.drawing) as doc:
+            found = part_views.find_views(doc, parts_dir, parts_dir / "trace.jsonl")
+        (parts_dir / "views_found.json").write_text(json.dumps(found, indent=2))
+        scan_parts(run.drawing, parts_dir, parts_dir / "views_found.json", model=MODEL)
+    else:
+        log.info("scanned drawing: reading the views with %s (views, parts, matching)", VISION_MODEL)
+        part_views.run(run.drawing, run_dir=parts_dir)
     calls = [json.loads(line) for line in (parts_dir / "trace.jsonl").read_text().splitlines()]
     cost = sum(c.get("cost") or 0 for c in calls)
     run.cost_usd += cost
@@ -897,6 +919,9 @@ def plan_from_parts(run: Run) -> dict:
     for v in views:
         w, h = sizes[v["sheet"]]
         x0, y0, x1, y1 = v["rect_pt"]
+        # register the view, so the plan can cite it as evidence and view_drawing can show it
+        run.views[v["id"]] = View(v["id"], v["name"] or v["id"], None, parts_dir / "views" / f"{v['id']}_matched.png",
+                                  None, sheet_box=[x0 / w, y0 / h, x1 / w, y1 / h])
         listing.append({"id": v["id"], "name": v["name"], "kind": v["kind"], "sheet": v["sheet"],
                         "sheet_box_fraction": [round(x0 / w, 3), round(y0 / h, 3), round(x1 / w, 3), round(y1 / h, 3)],
                         "size_pt": [round(x1 - x0, 1), round(y1 - y0, 1)]})
@@ -978,6 +1003,14 @@ def build(run: Run, plan_result: dict, corrections: dict | None = None) -> dict:
                  + "\n```\n\n## Previous script\n```python\n" + corrections["previous_script"] + "\n```")
     report = run_agent(load_agent("builder"), Ctx(run), [{"type": "text", "text": text}])
     step = run.dir / "model.step"
+    if not step.is_file():  # one more try, told why the last one failed
+        log.info("build: no valid solid; asking the builder once more")
+        failed = {"notes": report.get("notes", []),
+                  "features": [{k: f.get(k) for k in ("id", "state", "note")} for f in report.get("features", [])]}
+        report = run_agent(load_agent("builder"), Ctx(run), [{"type": "text", "text": text + (
+            "\n\n# Your previous attempt failed\n\nIt produced no valid single solid. Its report:\n```json\n"
+            + json.dumps(failed, indent=1, ensure_ascii=False) + "\n```\nFind the cause and fix it; do not give up "
+            "while a different construction could still give one connected solid.")}], label="builder[retry]")
     if not step.is_file():
         report = {**report, "status": "failed", "notes": report.get("notes", []) + [
             "No script produced a valid single solid, so no STEP was written."]}
