@@ -87,11 +87,25 @@ Reply with JSON only:
   "dimensions": ["Ø36", "4"], "hidden": false, "notes": ""}}]}}"""
 
 
+# Model families trained to give image positions on a 0-1000 grid; they answer on it even when asked for pixels.
+NORM1000_FAMILIES = ("google/gemini", "qwen/", "z-ai/glm")
+
+
+def norm1000() -> bool:
+    return VISION_MODEL.startswith(NORM1000_FAMILIES)
+
+
 def coords_text(w: int, h: int) -> str:
+    if norm1000():
+        return ("integers on a 0-1000 grid over the image, x = 1000 * px / width from the left edge, "
+                "y = 1000 * py / height from the top edge")
     return f"pixels of a {w} x {h} image, x from the left edge, y from the top edge"
 
 
-def to_px(xy: list) -> list[float]:
+def to_px(xy: list, w: int = 0, h: int = 0) -> list[float]:
+    """A position in the model's answer -> pixels of the image it was shown."""
+    if norm1000() and w and h:
+        return [xy[0] * w / 1000, xy[1] * h / 1000]
     return [float(xy[0]), float(xy[1])]
 
 
@@ -113,7 +127,7 @@ def find_views(doc: pymupdf.Document, run: Path, trace: Path) -> list[dict]:
         for view in data.get("views", []):
             if len(view.get("box") or []) != 4:
                 continue
-            (x0, y0), (x1, y1) = (to_px(view["box"][:2]), to_px(view["box"][2:]))
+            (x0, y0), (x1, y1) = (to_px(view["box"][:2], w, h), to_px(view["box"][2:], w, h))
             x0, x1, y0, y1 = min(x0, x1) / zoom, max(x0, x1) / zoom, min(y0, y1) / zoom, max(y0, y1) / zoom
             rect = pymupdf.Rect(x0 - pad, y0 - pad, x1 + pad, y1 + pad) & page.rect
             if rect.is_empty or rect.width < 10 or rect.height < 10:
@@ -186,8 +200,8 @@ Colour the object drawn in the first image by its parts: split it into its disti
 recognisable physical region or feature, such as a flange, boss, shaft step, bore, hole, slot, tab, bend,
 rib, fillet zone or flat panel. Holes and bores are parts too. Split a flat pattern at its bend lines into
 separate panels. A part may be partly visible, hidden, cut by a section or seen edge-on.
-Outline each part in pixel coordinates of the FIRST image (x from the left edge, y from the top edge), as
-precisely as you can along the drawn lines:
+Outline each part in coordinates of the FIRST image ({coords}), as precisely as you can along the
+drawn lines:
 - {{"polygon": [[x, y], ...]}}: 3 to 40 points in order around the outline; follow curves with enough points;
 - {{"circle": {{"center": [x, y], "radius": r}}}}: a round outline (hole, boss, flange seen end-on).
 A part with openings inside it (a ring, a plate with holes) lists them in "holes", in the same form.
@@ -198,15 +212,16 @@ Reply with JSON only:
   "dimensions": ["Ø36", "4"], "hidden": false, "notes": ""}}]}}"""
 
 
-def direct_outline(spec: dict) -> list[list[float]]:
+def direct_outline(spec: dict, w: int = 0, h: int = 0) -> list[list[float]]:
     """{"polygon": [...]} or {"circle": {...}} from the direct prompt, as a pixel polygon ([] if unusable)."""
     spec = spec or {}
     if isinstance(spec.get("circle"), dict):
         c, r = spec["circle"].get("center"), spec["circle"].get("radius")
         if isinstance(c, list) and len(c) == 2 and isinstance(r, (int, float)) and r > 0:
-            return [[c[0] + r * math.cos(a * math.pi / 24), c[1] + r * math.sin(a * math.pi / 24)] for a in range(48)]
+            (cx, cy), r = to_px(c, w, h), (r * w / 1000 if norm1000() and w else r)
+            return [[cx + r * math.cos(a * math.pi / 24), cy + r * math.sin(a * math.pi / 24)] for a in range(48)]
         return []
-    poly = [to_px(q) for q in spec.get("polygon", []) if isinstance(q, list) and len(q) == 2]
+    poly = [to_px(q, w, h) for q in spec.get("polygon", []) if isinstance(q, list) and len(q) == 2]
     return poly if len(poly) >= 3 else []
 
 
@@ -218,16 +233,16 @@ def label_parts_direct(view: dict, run: Path, trace: Path) -> list[dict]:
         w, h = round(doc[0].rect.width * zoom), round(doc[0].rect.height * zoom)
     (vdir / f"{vid}.png").write_bytes(png)
     sheet = image_part((run / f"sheet_{view['sheet']}.png").read_bytes())
-    prompt = DIRECT_PROMPT.format(name=view["name"], kind=view["kind"], w=w, h=h)
+    prompt = DIRECT_PROMPT.format(name=view["name"], kind=view["kind"], w=w, h=h, coords=coords_text(w, h))
     data, _ = ask_json([{"type": "text", "text": prompt}, image_part(png), sheet], f"parts_{vid}", trace,
                        model=VISION_MODEL)
     parts = []
     for part in data.get("parts", []):
-        outer = direct_outline(part.get("outline"))
+        outer = direct_outline(part.get("outline"), w, h)
         if not outer:
             print(f"[parts_{vid}] dropped {part.get('id')}: outline {str(part.get('outline'))[:80]} not usable", flush=True)
             continue
-        holes = [h for h in (direct_outline(s) for s in part.get("holes", [])) if h]
+        holes = [hl for hl in (direct_outline(s, w, h) for s in part.get("holes", [])) if hl]
         parts.append({**part, "local_id": part.get("id"),
                       "polygon_pt": [[x / zoom, y / zoom] for x, y in outer],
                       "holes_pt": [[[x / zoom, y / zoom] for x, y in hole] for hole in holes]})
@@ -247,7 +262,7 @@ def label_parts(view: dict, run: Path, trace: Path) -> list[dict]:
     fmt = dict(name=view["name"], kind=view["kind"], w=w, h=h, coords=coords_text(w, h))
 
     def read_points(items: list) -> dict:
-        return {str(p["id"]): to_px(p["xy"]) for p in items
+        return {str(p["id"]): to_px(p["xy"], w, h) for p in items
                 if isinstance(p.get("xy"), list) and len(p["xy"]) == 2}
 
     def call(prompt: str, image: bytes, step: str) -> dict:
@@ -265,7 +280,7 @@ def label_parts(view: dict, run: Path, trace: Path) -> list[dict]:
     for e in data.get("edges", []):
         e = {**e, **{k: str(e[k]) for k in ("from", "to", "center") if e.get(k) is not None}}
         if isinstance(e.get("via"), list) and len(e["via"]) == 2:
-            e["via"] = to_px(e["via"])
+            e["via"] = to_px(e["via"], w, h)
         else:
             e.pop("via", None)
         edges.append(e)
