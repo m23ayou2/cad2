@@ -134,14 +134,19 @@ def draw_matched(run_dir: Path, views: list[dict], groups: list[dict], zoom: flo
 
 
 def scan_parts(drawing: Path, run_dir: Path, views_json: Path, model: str = MODEL) -> dict:
-    """The scan path's parts step: local segmentation and matching, then one LLM call reviewing the groups.
+    """The scan path's parts step: local segmentation and matching, the corrector agent (one call per view), then
+    one LLM call reviewing the groups.
     Writes the same files as part_views (views.json, matches.json, views/vK_matched.png, matched_all.png); the
     local matcher's own groups stay in matches_local.json. Returns {"views", "groups", "seconds"}."""
     import time
+    from src import corrector
     t0 = time.monotonic()
     out = local_parts.run(drawing, run_dir, views_json)
-    local = out["matches"]
     (run_dir / "matches_local.json").write_text((run_dir / "matches.json").read_text())
+    # the corrector agent fixes the segmentation's artifacts (views.json and matches.json are rewritten)
+    corrector.correct(run_dir, model)
+    out["views"] = json.loads((run_dir / "views.json").read_text())
+    out["matches"] = local = json.loads((run_dir / "matches.json").read_text())
     try:
         reviewed = llm_match(run_dir, out, out["zoom"], "review", model)
         groups = reviewed["groups"] or local["groups"]

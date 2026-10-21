@@ -41,7 +41,8 @@ def flat_pattern(parts_dir: Path) -> dict | None:
     # a view whose panels were moved from another is a copy; prefer the original
     v = min(flats, key=lambda v: (bool(v.get("transferred_from")), len(v["parts"])))
     panels = [Polygon(p["polygon_pt"]).buffer(0) for p in v["parts"] if p["feature"] == "panel"]
-    union = unary_union([p.buffer(0.8, join_style=2) for p in panels]).buffer(-0.8, join_style=2)
+    # panels are a drawn line (and, after corrections, a pixel or two) apart: bridge gaps up to 3 pt
+    union = unary_union([p.buffer(1.5, join_style=2) for p in panels]).buffer(-1.5, join_style=2)
     if union.geom_type != "Polygon":
         union = max(union.geoms, key=lambda g: g.area)
     outline = list(union.exterior.simplify(0.25).coords)[:-1]
