@@ -323,10 +323,11 @@ def fit_isometric(shape, view, views):
 
 
 # --------------------------------------------------------------------------- comparison
-def align(A, B, iterations=12):
-    """Translate the drawing points A onto the model points B. Starts from the bounding-box centres, then
-    refines with the median offset of the closest pairs, so a few stray marks cannot drag the fit."""
-    t = (B.min(0) + B.max(0)) / 2 - (A.min(0) + A.max(0)) / 2
+def align(A, B, iterations=12, start=None):
+    """Translate the drawing points A onto the model points B. Starts from the bounding-box centres (or from
+    `start`, an offset found by a wider search), then refines with the median offset of the closest pairs, so a
+    few stray marks cannot drag the fit."""
+    t = (B.min(0) + B.max(0)) / 2 - (A.min(0) + A.max(0)) / 2 if start is None else np.asarray(start, float)
     tree = cKDTree(B)
     size = float(np.max(B.max(0) - B.min(0))) or 1.0
     # coarse search first: the closest-pair refinement alone can lock onto a wrong offset when long edges in
@@ -383,13 +384,16 @@ def clusters(points, distances, tol, min_points=8):
     return sorted(out, key=lambda r: -r["length_mm"])[:8]
 
 
-def compare(A, B):
-    """A drawn, B model (view plane, mm). Returns metrics, regions and the aligned drawing points."""
-    A = align(A, B)
+def compare(A, B, tol=None, start=None):
+    """A drawn, B model (view plane, mm). Returns metrics, regions and the aligned drawing points. `tol` overrides
+    the default tolerance, e.g. for a scanned drawing whose edges are only accurate to about a pixel; `start` is an
+    initial offset for the alignment."""
+    A = align(A, B, start=start)
     da = cKDTree(B).query(A)[0]
     db = cKDTree(A).query(B)[0]
     size = float(np.max(B.max(0) - B.min(0)))
-    tol = max(0.03, 0.003 * size)  # drawn edges are exact: references fit to ~0.02 mm
+    if tol is None:
+        tol = max(0.03, 0.003 * size)  # drawn edges are exact: references fit to ~0.02 mm
     metrics = {
         "tolerance_mm": round(tol, 2),
         "mean_mm": round(float((da.mean() + db.mean()) / 2), 3),

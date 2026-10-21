@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -145,6 +145,8 @@ class Jobs:
                 record = json.loads(line)
                 if record.get("event") == "llm":
                     cost += (record.get("usage") or {}).get("cost") or 0
+                elif record.get("event") == "parts_pipeline":
+                    cost += record.get("cost_usd") or 0
             job["cost_usd"] = round(cost, 4)
         if run and (run / "result.json").is_file():
             r = json.loads((run / "result.json").read_text(encoding="utf-8"))
@@ -276,6 +278,8 @@ def step_title(label: str, seen: dict) -> str:
     inner = inner.rstrip("]")
     seen[base] = seen.get(base, 0) + 1
     if base == "main":
+        if inner == "scan":
+            return "Plan the part from the matched views"
         return f"Revise the plan ({inner})" if inner else "Read the drawing and plan the part"
     if base in VIEW_KINDS:
         return f"Read the {base} view ({inner})"
@@ -370,6 +374,13 @@ def steps(run: Path, running: bool) -> dict:
             step.update(status="done", t1=t, cost=r.get("cost_usd"))
             if (line_ := end_line(r.get("result"))):
                 step["details"].append(line_)
+        elif event == "parts_pipeline":
+            out.append({"title": f"Read the scanned drawing with {str(r.get('model', '')).split('/')[-1]}",
+                        "status": "done", "t0": t - timedelta(seconds=r.get("seconds") or 0) if t else None, "t1": t,
+                        "cost": r.get("cost_usd"),
+                        "details": [f"{len(r.get('views', []))} view(s): " + ", ".join(r.get("views", [])),
+                                    f"{r.get('parts')} part(s) outlined, matched into {len(r.get('groups', []))} group(s): "
+                                    + ", ".join(str(g) for g in r.get("groups", []))]})
         elif event == "projections":
             views = ((r.get("data") or {}).get("views")) or []
             out.append({"title": f"Project the model into every view (round {r.get('round')})", "status": "done",

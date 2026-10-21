@@ -15,29 +15,49 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 # --------------------------------------------------------------------------- operations
-# Fixed list, from the operations that appear on mechanical detail drawings. Anything
-# else (gear teeth, sheet metal, weldments, surfaces, engraving) is not an operation:
-# it goes in FeatureTree.unsupported, so the part is flagged instead of guessed.
+# The full list of operations that appear on drawings, grouped as in the operation table (core shape, holes and
+# edges, repeating and symmetry, helpers, sheet metal, weldments / assemblies / surfaces). Anything outside it fails
+# validation; a feature the planner cannot express with any of them goes in FeatureTree.unsupported.
 Op = Literal[
     # core shape
-    "extrude_boss", "revolve_boss", "extrude_cut", "revolve_cut", "boolean",
+    "sketch", "extrude_boss", "revolve_boss", "extrude_cut", "revolve_cut", "boolean",
     "sweep", "loft", "shell", "rib", "draft", "thicken",
     # holes and edges
     "hole", "counterbore_hole", "countersink_hole", "tapped_hole", "external_thread",
-    "slot", "keyway", "chamfer", "fillet", "knurl",
+    "slot", "keyway", "chamfer", "fillet", "knurl", "gear_teeth",
+    # repeating and symmetry (they act on earlier features, listed in `targets`)
+    "linear_pattern", "circular_pattern", "mirror",
+    # helpers that are rarely drawn
+    "reference_plane", "reference_axis", "reference_point", "engraving",
+    # sheet metal
+    "base_flange", "edge_flange", "bend", "punch", "flat_pattern",
+    # weldments, assemblies and surfaces
+    "structural_member", "weld_bead", "assembly_mate", "surface_model", "deform",
 ]
+
+# A profile is geometry: a list of points, or one of these simple shapes sized by the other params.
+PROFILE_WORDS = ("rectangle", "rect", "square", "circle", "obround", "hexagon")
+
+# Operations that act on earlier features rather than on a sketch of their own: they name them in `targets`.
+TARGETED_OPS = {"boolean", "linear_pattern", "circular_pattern", "mirror", "bend", "edge_flange", "flat_pattern",
+                "weld_bead", "assembly_mate", "deform"}
 
 # Parameters each operation needs. A tuple means "at least one of these".
 REQUIRED_PARAMS: dict[str, list[str | tuple[str, ...]]] = {
+    # core shape
+    "sketch": ["profile"],
     "extrude_boss": ["profile", "height"],
     "extrude_cut": ["profile", ("depth", "thru")],
     "revolve_boss": ["profile"],
     "revolve_cut": ["profile"],
     "boolean": ["operation"],
+    "sweep": ["profile", "path"],
+    "loft": ["profile"],
     "shell": ["wall"],
     "rib": ["thickness"],
     "draft": ["angle"],
     "thicken": ["thickness"],
+    # holes and edges
     "hole": ["d", ("depth", "thru")],
     "counterbore_hole": ["d", "cbore_d", "cbore_depth", ("depth", "thru")],
     "countersink_hole": ["d", "csk_d", "csk_angle", ("depth", "thru")],
@@ -47,9 +67,27 @@ REQUIRED_PARAMS: dict[str, list[str | tuple[str, ...]]] = {
     "keyway": ["width", "depth", "length"],
     "chamfer": ["size"],
     "fillet": ["r"],
+    "knurl": ["pitch", "length"],
+    "gear_teeth": ["teeth", ("module", "pitch_diameter")],
+    # repeating and symmetry
+    "linear_pattern": ["count", "spacing"],
+    "circular_pattern": ["count"],
+    "mirror": ["plane"],
+    # helpers
+    "engraving": ["text", "depth"],
+    # sheet metal
+    "base_flange": ["profile", "thickness"],
+    "edge_flange": ["length", "angle"],
+    "bend": ["line", "angle", "direction"],   # line: [[x1, y1], [x2, y2]] across the flat blank
+    "punch": ["profile", "depth"],
+    # weldments, assemblies and surfaces
+    "structural_member": ["section", "path"],
+    "weld_bead": ["size"],
 }
 
-CHECK_RE = re.compile(r"^(bbox|volume|projection:[a-z0-9_,]+|cylinder:[a-z0-9_.=,]+|count:[a-z0-9_.=,]+)$")
+# view ids may be upper case (scans: S1, S2); a bbox or volume check may carry its expected values
+CHECK_RE = re.compile(r"^(bbox(:[0-9.,x ]+)?|volume(:[0-9.]+)?|projection:[A-Za-z0-9_, ]+|cylinder:[a-z0-9_.=,]+|"
+                      r"count:[a-z0-9_.=,]+)$", re.IGNORECASE)
 SHEET_SOURCES = {"title_block", "notes"}
 
 ParamValue = Union[float, int, bool, str, list[float], list[list[float]]]
@@ -190,6 +228,8 @@ class Feature(Strict):
     direction: Axis | None = Field(None, description="Extrude, hole or revolve axis direction")
     long_axis: Axis | None = Field(None, description="Slots and obround profiles: the direction their length runs")
     pattern: Pattern | None = None
+    targets: list[str] = Field(default_factory=list, description="Ids of the earlier features this operation acts "
+                               "on: patterns, mirror, boolean, bend, edge_flange, weld_bead, ...")
     extends_into: str | None = Field(None, pattern=r"^F\d{2}$", description="Id of the round body this feature "
                                      "merges into (a support under a barrel, a boss on a cylinder): the harness then "
                                      "computes its height up to that body's axis; leave the height out")
@@ -226,6 +266,13 @@ class Feature(Strict):
                 missing.append(" or ".join(options))
         if missing:
             raise ValueError(f"{self.id} ({self.op}) is missing param(s): {', '.join(missing)}")
+        profile = self.params.get("profile")
+        if isinstance(profile, str) and not profile.strip().lower().startswith(PROFILE_WORDS):
+            raise ValueError(f"{self.id}.profile is a description ({profile[:60]!r}), not geometry: give the outline "
+                             f"as [[x, y], ...] points (or a word from {list(PROFILE_WORDS)} with its sizes in "
+                             f"params). If you cannot read the outline, put the feature in `unsupported` instead")
+        if self.op in {"linear_pattern", "circular_pattern", "mirror", "boolean"} and not self.targets:
+            raise ValueError(f"{self.id} ({self.op}) needs `targets`: the ids of the features it acts on")
         if self.position is None and not self.placements:
             raise ValueError(f"{self.id} has no position: give `position` [x, y, z], or `placements` with one "
                              f"entry per instance")
@@ -271,6 +318,10 @@ class FeatureTree(Strict):
                 if dep not in seen:
                     errors.append(f"{f.id} depends on {dep}, which is not an earlier feature")
             seen.add(f.id)
+        for f in self.features:
+            later = [t for t in f.targets if t not in seen or t == f.id]
+            if later:
+                errors.append(f"{f.id}.targets {later}: a target must be an earlier feature")
         covered = {ref for a in self.assumptions for ref in a.covers}
         for ref in covered:
             if ref.split(".")[0] not in seen:
@@ -402,7 +453,37 @@ class ArbiterReport(Strict):
     notes: list[str] = Field(default_factory=list)
 
 
+class CornerVerdict(Strict):
+    """One traced corner, judged from its patch."""
+    corner: str = Field(pattern=r"^V\d+$", description="The corner id written on its patch, e.g. V7")
+    verdict: Literal["real_corner", "on_edge", "artifact"] = Field(
+        description="real_corner: the part's outline really turns here (a corner, or where a line meets an arc); "
+                    "on_edge: the point lies on the part's edge but the edge does not turn here (along a straight "
+                    "line or a smooth arc); artifact: the blue trace is not on the part's edge here (it follows an "
+                    "arrowhead, a leader, a dimension or extension line, a centre line or text, or cuts a corner)")
+    reason: str = Field(description="What you see in the patch, in a few words")
+
+
+class CornerCheck(Strict):
+    """The answer of the corner check: one verdict per corner shown."""
+    corners: list[CornerVerdict]
+    notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def every_corner_once(self, info: ValidationInfo) -> CornerCheck:
+        shown = (info.context or {}).get("corners")
+        given = [c.corner for c in self.corners]
+        if shown:
+            missing = [c for c in shown if c not in given]
+            extra = sorted({c for c in given if c not in shown})
+            twice = sorted({c for c in given if given.count(c) > 1})
+            if missing or extra or twice:
+                raise ValueError(f"answer every corner shown exactly once; missing {missing}, unknown {extra}, "
+                                 f"answered twice {twice}")
+        return self
+
+
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
-    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport,
+    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport, CornerCheck,
 )}

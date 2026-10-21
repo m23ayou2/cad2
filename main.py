@@ -54,6 +54,15 @@ import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 MODEL = os.getenv("D2C_MODEL") or "openai/gpt-6-luna"  # the web interface sets D2C_MODEL per job
+# Scanned drawings (no vector geometry, no text layer) take another path: VISION_MODEL reads the sheet (views,
+# parts outlined directly, parts matched across views; src/part_views.py); then the planner and the validation
+# agents run on SCAN_REASON_MODEL, and the builder on the cheap SCAN_BUILD_MODEL.
+VISION_MODEL = os.getenv("D2C_VISION_MODEL") or "anthropic/claude-opus-5.5"
+SCAN_REASON_MODEL = os.getenv("D2C_SCAN_REASON_MODEL") or "anthropic/claude-sonnet-5.5"
+SCAN_BUILD_MODEL = os.getenv("D2C_SCAN_BUILD_MODEL") or "anthropic/claude-haiku-5.5"
+# A scan's budget for planning, building and validation (USD), on top of what the vision model costs: the reasoning
+# model costs far more per call than the vector path's, whose budget is agents/main.md's max_cost_usd.
+SCAN_MAX_COST_USD = float(os.getenv("D2C_SCAN_MAX_COST") or 3.0)
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -132,6 +141,7 @@ class Run:
     summaries: list[dict] = field(default_factory=list)
     build_attempts: int = 0
     cross_check: dict | None = None  # conflicts between the view analyses and the arbiter's rulings
+    scanned: bool = False  # no vector geometry: the vision model reads the sheet (plan_from_parts)
 
     def __post_init__(self):
         self.build_attempts = len(list((self.dir / "build").glob("attempt_*.py")))  # continue on --build
@@ -586,6 +596,14 @@ def image_part(png: bytes) -> dict:
 
 
 # --------------------------------------------------------------------------- agent loop
+def agent_model(agent: Agent, run: Run) -> str:
+    """The model an agent runs on: MODEL for a vector drawing; on a scan, SCAN_BUILD_MODEL for the builder and
+    SCAN_REASON_MODEL for the planner and the validation agents."""
+    if not run.scanned:
+        return MODEL
+    return SCAN_BUILD_MODEL if agent.name == "builder" else SCAN_REASON_MODEL
+
+
 def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = None) -> dict:
     """Run one agent until it replies with JSON; return the parsed JSON."""
     run, label = ctx.run, label or agent.name
@@ -608,7 +626,7 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
         if "temperature" in agent.settings:
             kwargs["temperature"] = agent.settings["temperature"]
         t0 = time.monotonic()
-        reply = run.client.chat.completions.create(model=MODEL, messages=messages,
+        reply = run.client.chat.completions.create(model=agent_model(agent, run), messages=messages,
                                                    extra_body={"usage": {"include": True}}, **kwargs)
         usage = reply.usage.model_dump() if reply.usage else {}
         cost = usage.get("cost")
@@ -785,8 +803,128 @@ def save_plan(run: Run, result: dict) -> dict:
     return result
 
 
+def is_scanned(drawing: Path) -> bool:
+    """A scan: no page has vector drawing commands or text, only images."""
+    with pymupdf.open(drawing) as doc:
+        return not any(page.get_drawings() or page.get_text("words") for page in doc)
+
+
+PARTS_BRIEF = """# The views are already read
+
+This drawing is a scan. Its views were read by a vision model ({vision}): each view was found on the sheet,
+split into coloured parts (P1, P2, ... numbered across all views), and the parts were matched across views into
+groups (G1, G2, ...). One group = one physical part of the object (a panel, a tab, a bend, a hole ...) with
+every label it has in every view, and the dimensions printed on the drawing that belong to it.
+
+The groups replace split_views and the view subagents, which are not available. Do step 1 (`view_drawing`,
+`read_drawing_text`; the drawing has no text layer, so read every value from the image), then plan the part:
+- Every group must end up in the feature tree (one or more features), or in `uncertainties` with the reason.
+  Use the groups to decide the operations and their order: for a sheet-metal part, which flat panel becomes
+  which formed face, which panel stays flat, where each hole is, which way each bend goes.
+- **Sizes come from the dimensions printed on the drawing.** Zoom with `view_drawing` (regions as fractions of
+  the sheet; each view's `sheet_box_fraction` below) to read them. The outlines below are in PDF points of each
+  cropped view (1 pt = 1/72 inch, the view's top-left origin, y down) and are approximate: use them for
+  positions, proportions and which edge is which, and to turn distances into mm only through a printed
+  dimension of the same view.
+- The matching is automatic and can be wrong. When the drawing contradicts a group, follow the drawing and
+  write it in `uncertainties`.
+- `frame.views` lists the views by the ids below (v1, v2, ...).
+
+## Sheet metal (the sheet shows a flat pattern)
+
+Build the part as a `base_flange` followed by one `bend` per bend line (see the sheet-metal rules in step 4);
+the builder folds it with `fold_sheet`. Use the groups to fill it in:
+- **The blank** (`base_flange.profile`, in mm): origin at the lower-left corner of the blank, x right, y up,
+  as drawn. Take every coordinate from the ordinate dimensions of the dimensioned flat pattern, using the flat
+  view's part outlines to see which ordinate locates which edge, and the radius callouts (R25, R3.5, R2 ...)
+  on the copy with the callouts for the arcs and rounded corners. Follow the outline all the way round.
+- **The panels**: each flat-pattern group that is a panel or a tab is one panel of the blank; its group says
+  which face of the formed part it becomes in the isometric views.
+- **`fixed`**: a point `[x, y]` inside the panel whose group is the face lying flat in the isometrics (the
+  base the part rests on).
+- **Each bend line**: the straight boundary between two matched flat panels (a bend group's outline in the
+  flat view straddles it; the line is its middle), running right across the strip that joins the two panels.
+  Its `direction` and `radius` come from the callout next to it (`BEND UP R1` -> up, radius 1; `BEND DOWN` ->
+  down; no radius given -> the notes' radius). Check each one against the isometric: the panel beyond the line,
+  seen from the fixed panel, must rise (up) or drop (down) as drawn there.
+- **Holes**: a `hole` at each hole's flat position on the blank `[x, y, 0]`, diameter from its callout; the
+  hole's group says which panel it is in, and its ordinates on the dimensioned flat pattern give the centre.
+
+## Views
+```json
+{views}
+```
+
+## Matched groups
+```json
+{groups}
+```
+
+## Parts per view (outlines in the view's points)
+```json
+{parts}
+```
+
+The images follow: all views coloured by group (same colour = same group in every view), then each view alone."""
+
+
+def plan_from_parts(run: Run) -> dict:
+    """Scanned drawing: the vision model reads it (src/part_views.py, saved in parts/), then the main agent plans
+    the feature tree from the matched groups, with only the sheet as a tool."""
+    import src.llm as llm
+    import src.part_views as part_views
+    llm.VISION_MODEL, llm.MODEL, part_views.VISION_MODEL = VISION_MODEL, MODEL, VISION_MODEL
+    part_views.PARTS_METHOD = "direct"
+    parts_dir = run.dir / "parts"
+    log.info("scanned drawing: reading the views with %s (views, parts, matching)", VISION_MODEL)
+    t0 = time.monotonic()
+    part_views.run(run.drawing, run_dir=parts_dir)
+    calls = [json.loads(line) for line in (parts_dir / "trace.jsonl").read_text().splitlines()]
+    cost = sum(c.get("cost") or 0 for c in calls)
+    run.cost_usd += cost
+    run.max_cost_usd += cost  # the planner's budget is its own, not shared with the vision model
+    run.cost_unknown_calls += sum(1 for c in calls if c.get("cost") is None)
+    views = json.loads((parts_dir / "views.json").read_text())
+    groups = json.loads((parts_dir / "matches.json").read_text())["groups"]
+    run.trace("parts_pipeline", model=VISION_MODEL, calls=len(calls), cost_usd=cost,
+              seconds=round(time.monotonic() - t0, 1), views=[v["name"] for v in views],
+              parts=sum(len(v["parts"]) for v in views), groups=[g.get("name") for g in groups])
+    log.info("vision model: %d view(s), %d group(s), cost $%.4f", len(views), len(groups), cost)
+
+    with pymupdf.open(run.drawing) as doc:
+        sizes = {i + 1: (p.rect.width, p.rect.height) for i, p in enumerate(doc)}
+    listing, parts = [], {}
+    for v in views:
+        w, h = sizes[v["sheet"]]
+        x0, y0, x1, y1 = v["rect_pt"]
+        listing.append({"id": v["id"], "name": v["name"], "kind": v["kind"], "sheet": v["sheet"],
+                        "sheet_box_fraction": [round(x0 / w, 3), round(y0 / h, 3), round(x1 / w, 3), round(y1 / h, 3)],
+                        "size_pt": [round(x1 - x0, 1), round(y1 - y0, 1)]})
+        parts[v["id"]] = [{"label": p["id"], "name": p.get("name"), "feature": p.get("feature"),
+                           "dimensions": p.get("dimensions", []), "hidden": p.get("hidden", False),
+                           "outline_pt": [[round(x, 1), round(y, 1)] for x, y in p["polygon_pt"]],
+                           "holes_pt": [[[round(x, 1), round(y, 1)] for x, y in hole] for hole in p.get("holes_pt", [])],
+                           "notes": p.get("notes", "")} for p in v["parts"]]
+    text = PARTS_BRIEF.format(vision=VISION_MODEL, views=json.dumps(listing, indent=1, ensure_ascii=False),
+                              groups=json.dumps(groups, indent=1, ensure_ascii=False),
+                              parts=json.dumps(parts, ensure_ascii=False))
+    content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}.\n\n{text}"},
+               {"type": "text", "text": "All views, coloured by group:"},
+               image_part((parts_dir / "matched_all.png").read_bytes())]
+    for v in views:
+        content += [{"type": "text", "text": f"View {v['id']} ({v['name']}), coloured by group:"},
+                    image_part((parts_dir / "views" / f"{v['id']}_matched.png").read_bytes())]
+    agent = load_agent("main")
+    agent.settings = {**agent.settings, "tools": ["view_drawing", "read_drawing_text"]}
+    result = run_agent(agent, Ctx(run), content, label="main[scan]")
+    return save_plan(run, {**result, "summaries": [], "cross_check": None, "parts": "parts/matches.json"})
+
+
 def plan(run: Run) -> dict:
-    """Main agent + view subagents -> feature tree (feature_tree.json, plan.json)."""
+    """Main agent + view subagents -> feature tree (feature_tree.json, plan.json); a scan goes through
+    plan_from_parts instead."""
+    if run.scanned:
+        return plan_from_parts(run)
     content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}. Start with step 1."}]
     result = run_agent(load_agent("main"), Ctx(run), content)
     return save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check})
@@ -879,15 +1017,19 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
         shutil.copyfile(run.dir / name, out_dir / name)
     vlog = log.getChild("validate")
     result = {"round": round_no, "reports": [], "pose": None, "measured": []}
-    if not any(v.pdf for v in run.views.values()):
-        vlog.warning("no vector views to compare with (scanned drawing?); model not validated")
+    scans = scan_entries(run, out_dir) if run.scanned else []
+    if not scans and not any(v.pdf for v in run.views.values()):
+        vlog.warning("no views to compare with; model not validated")
         return result
     t0 = time.monotonic()
+    # a scan is compared on its pixels (src/raster_check.py), a vector drawing on its geometry (src/validate.py);
+    # both write validation.json in the same format
+    command = ([sys.executable, str(ROOT / "src" / "raster_check.py"), str(run.drawing), str(run.dir / "model.step"),
+                str(out_dir / "scans.json"), str(out_dir)] if scans else
+               [sys.executable, str(ROOT / "src" / "validate.py"), str(run.dir / "views"),
+                str(run.dir / "model.step"), str(out_dir), str(run.drawing)])
     try:
-        subprocess.run([sys.executable, str(ROOT / "src" / "validate.py"), str(run.dir / "views"),
-                        str(run.dir / "model.step"), str(out_dir), str(run.drawing)], cwd=ROOT / "src",
-                       timeout=VALIDATE_TIMEOUT_S,
-                       capture_output=True, text=True)
+        subprocess.run(command, cwd=ROOT / "src", timeout=VALIDATE_TIMEOUT_S, capture_output=True, text=True)
         data = json.loads((out_dir / "validation.json").read_text(encoding="utf-8"))
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
         vlog.warning("projection check failed: %s; model not validated", error)
@@ -898,6 +1040,10 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
     run.trace("projections", round=round_no, data=data)
 
     by_pdf = {v.pdf.stem: v for v in run.views.values() if v.pdf}
+    for entry in data["views"] if scans else []:  # a scanned view: its agent is the kind it fitted best
+        s = next(x for x in scans if x["id"] == entry["view_id"])
+        kind = entry.get("class") if entry.get("class") in VALIDATORS else None
+        by_pdf[s["id"]] = View(s["id"], s["label"], None, out_dir / f"{s['id']}.drawing.png", kind)
     tree = plan_result["feature_tree"]
     compact = [{k: f.get(k) for k in ("id", "name", "op", "params", "on", "position", "direction", "pattern")}
                for f in tree["features"]]
@@ -923,9 +1069,23 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
                 + json.dumps({"frame": tree["frame"], "features": compact,
                               "assumptions": tree.get("assumptions", [])}, indent=1, ensure_ascii=False) + "\n```")
         content = [{"type": "text", "text": text}]
-        for key, caption in (("drawing", "The drawing view:"), ("model", "The model projection, same direction:"),
-                             ("overlay", "Overlay (drawing black, model red; orange = drawn but missing, "
-                                         "purple = in model but not drawn):")):
+        filled = str(entry["images"].get("drawing", "")).endswith("_filled.png")
+        captions = ((("drawing", "The scanned view, every region it encloses filled in its own colour:"),
+                     ("model", "The model, projected from the camera that fits the view best, drawn in the view's "
+                               "own pixel frame, every face filled in its own colour:"),
+                     ("overlay", "Silhouettes over the scan: green = both, orange = drawn but not in the model, "
+                                 "purple = in the model but not drawn; the model's edges in purple lines:"),
+                     ("matches", "Match sheet: scan (left) and model (right), one line per hole matched between "
+                                 "them; red = a suspect match:"))
+                    if filled else
+                    (("drawing", "The drawing view:"), ("model", "The model projection, same direction:"),
+                     ("overlay", "Overlay (drawing black, model red; orange = drawn but missing, "
+                                 "purple = in model but not drawn):")))
+        if scans:
+            content[0]["text"] += ("\n\nThis drawing is a scan: the camera and scale were fitted to the scan, not "
+                                   "measured, and no dimension callouts are checked. Judge the shape: what is drawn "
+                                   "but missing in the model, what the model has that is not drawn.")
+        for key, caption in captions:
             if key in entry["images"]:
                 content += [{"type": "text", "text": caption},
                             image_part(Path(entry["images"][key]).read_bytes())]
@@ -944,6 +1104,33 @@ def validate(run: Run, plan_result: dict, round_no: int) -> dict:
             vlog.info("    [%s/%s] %s %s: %s", issue["severity"], issue["owner"], issue.get("feature") or "-",
                       issue["kind"], issue["fix"])
     return result
+
+
+VALIDATORS = ("front", "top", "side", "section", "detail", "isometric")
+
+
+def scan_entries(run: Run, out_dir: Path) -> list[dict]:
+    """The views the vision model found on a scan (parts/views.json), as src/raster_check.py entries in
+    scans.json: isometrics as isometric views; orthographic views and sections as "auto" (a scan gives no reliable
+    direction, so every standard direction is tried and the best fit kept); flat patterns are left out, since the
+    model is the formed part."""
+    views_json = run.dir / "parts" / "views.json"
+    if not views_json.is_file():
+        return []
+    with pymupdf.open(run.drawing) as doc:
+        sizes = {i + 1: (p.rect.width, p.rect.height) for i, p in enumerate(doc)}
+    entries = []
+    for v in json.loads(views_json.read_text()):
+        if v.get("kind") == "flat_pattern":
+            continue
+        w, h = sizes[v["sheet"]]
+        x0, y0, x1, y1 = v["rect_pt"]
+        entries.append({"id": v["id"], "label": v.get("name") or v["id"],
+                        "kind": "isometric" if v.get("kind") == "isometric" else "auto", "direction": "none",
+                        "box": [x0 / w, y0 / h, x1 / w, y1 / h], "folder": str(out_dir / "scans" / v["id"])})
+        Path(entries[-1]["folder"]).mkdir(parents=True, exist_ok=True)
+    (out_dir / "scans.json").write_text(json.dumps(entries, indent=1), encoding="utf-8")
+    return entries
 
 
 def screen_orientation_issues(report: dict, entry: dict, pose: dict, vlog: logging.Logger) -> dict:
@@ -1011,6 +1198,11 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     """Plan, build, validate and correct a drawing in a new run folder, or rebuild an existing run's plan."""
     max_cost = float(load_agent("main").settings.get("max_cost_usd", 1.0))
     if rebuild:
+        drawing = Path(json.loads((rebuild / "trace.jsonl").open().readline())["drawing"])
+    scanned = is_scanned(drawing)
+    if scanned:
+        max_cost = SCAN_MAX_COST_USD
+    if rebuild:
         plan_result = (json.loads((rebuild / "plan.json").read_text(encoding="utf-8"))
                        if (rebuild / "plan.json").is_file() else {})
         plan_result["feature_tree"] = json.loads((rebuild / "feature_tree.json").read_text(encoding="utf-8"))
@@ -1023,8 +1215,15 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
         run_dir = RUNS_DIR / f"{drawing.parent.parent.name}-{drawing.parent.name}-{stamp}"
         run_dir.mkdir(parents=True)
         run = open_run(drawing, run_dir, max_cost)
-        run.trace("run_start", drawing=str(drawing), model=MODEL)
-    log.info("run %s: %s with %s", run.dir.name, drawing, MODEL)
+        run.trace("run_start", drawing=str(drawing), scanned=scanned,
+                  models={"vision": VISION_MODEL, "reasoning": SCAN_REASON_MODEL, "builder": SCAN_BUILD_MODEL}
+                  if scanned else {"all": MODEL})
+    run.scanned = scanned
+    if scanned:
+        log.info("run %s: %s is a scan: views read by %s, planning and validation on %s, building on %s",
+                 run.dir.name, drawing, VISION_MODEL, SCAN_REASON_MODEL, SCAN_BUILD_MODEL)
+    else:
+        log.info("run %s: %s with %s", run.dir.name, drawing, MODEL)
     started = time.monotonic()
     rounds, report, corrections = [], {"status": "failed"}, None
     sent_to = {}  # issue key -> owner it was sent to in the last correction round
@@ -1074,7 +1273,9 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     final = min(rounds, key=round_rank) if rounds else None
     out = run.dir / "result.json"
     out.write_text(json.dumps({
-        "drawing": str(drawing), "model": MODEL, "status": final["build"] if final else report["status"],
+        "drawing": str(drawing), "model": SCAN_REASON_MODEL if run.scanned else MODEL,
+        "models": ({"vision": VISION_MODEL, "reasoning": SCAN_REASON_MODEL, "builder": SCAN_BUILD_MODEL}
+                   if run.scanned else {"all": MODEL}), "status": final["build"] if final else report["status"],
         "validated": bool(final and final["measured_views"]),  # judged by eye only does not count
         "measured_views": final["measured_views"] if final else 0,
         "drawn_covered": final["drawn_covered"] if final else None,

@@ -61,20 +61,52 @@ Write **one feature tree for the whole part**, in the order a CAD modeller would
 
 | Cue on the drawing | op |
 |---|---|
+| **Core shape** | |
+| A closed outline that several features share (a profile used twice) | `sketch` |
 | Plate or block outline with a thickness | `extrude_boss` |
 | Concentric circles in one view, stepped profile in a section | `revolve_boss` (profile as `[[r, z], ...]` points) |
 | Pocket, notch, flat, through-cut | `extrude_cut` |
 | Groove, undercut, relief around an axis | `revolve_cut` |
-| `Ø… THRU`, `Ø… x 10 DEEP` | `hole` |
+| Separate bodies joined, subtracted or intersected | `boolean` (`operation`: union, subtract or intersect; `targets`) |
+| Bent tube, curved rail: a section moved along a path | `sweep` (`profile`, `path`) |
+| A transition between different sections | `loft` (`profile`, and the other sections in `sections`) |
+| `WALL 2`, thin-walled housing | `shell` |
+| Thin stiffening wall in a casting or housing | `rib` |
+| Draft angle note, cast or moulded faces | `draft` |
+| Thin sheet-like shape given a thickness | `thicken` |
+| **Holes and edges** | |
+| `Ø… THRU`, `2x Ø…`, `Ø… x 10 DEEP` | `hole` |
 | `CBORE`, `C'BORE`, ⌴ | `counterbore_hole` |
 | `CSK`, ⌵ | `countersink_hole` |
 | `M6`, `M8 x 1.25` on a hole | `tapped_hole` |
-| `M12` on a shaft | `external_thread` |
+| `M12 x 1.75` on a shaft | `external_thread` |
 | Obround or rectangular elongated cut | `slot` |
-| Key slot in a shaft or bore | `keyway` |
-| `1 x 45°`, `C1` | `chamfer` |
+| Key slot in a shaft or bore (width x depth) | `keyway` |
+| `0.5 x 45°`, `C1` | `chamfer` |
 | `R…` on an edge, `ALL FILLETS R2` | `fillet` |
-| `WALL 2`, thin-walled housing | `shell` |
+| `KNURL` note | `knurl` |
+| Gear or spline data table, `SPLINE`, module and tooth count | `gear_teeth` |
+| **Repeating and symmetry** | |
+| `4x` along a line, `EQ SP`, a spacing dimension | `linear_pattern` (`count`, `spacing`, `targets`), or `pattern` on the feature itself |
+| `6x` on a bolt circle, `PCD` | `circular_pattern` (`count`, `targets`), or `pattern` on the feature itself |
+| `SYMMETRIC ABOUT…`, a half drawn with a centreline | `mirror` (`plane`, `targets`) |
+| **Helpers** | |
+| Datum A, B, C that other features are placed from | `reference_plane` / `reference_axis` / `reference_point` |
+| `MARK`, `ENGRAVE` note | `engraving` (`text`, `depth`) |
+| **Sheet metal** | |
+| `MATERIAL THICKNESS 2`, `SHEET THICKNESS 3`: the part starts as a flat blank | `base_flange` (`profile` = the flat blank outline, `thickness`) |
+| A bent wall added along an edge | `edge_flange` (`length`, `angle`, `radius`, `targets`) |
+| `BEND UP 90° R2`, `BEND DOWN`, bend lines on a flat pattern | `bend` (`line` on the flat blank, `angle`, `direction` up or down, `radius`, `targets`) |
+| Louver, punched or formed shape in the sheet | `punch` |
+| A separate unfolded view of the blank | `flat_pattern` (documents the blank; the part is built by `base_flange` + `bend`) |
+| **Weldments, assemblies and surfaces** | |
+| `RHS 40x40x3`, beam or tube profile along a path | `structural_member` (`section`, `path`) |
+| Weld symbol | `weld_bead` (`size`, `targets`) |
+| Balloons and a bill of materials (assembly drawing) | `assembly_mate` |
+| Free-form curved body with no simple dimensions | `surface_model` |
+| Dome, wrap or flex callout | `deform` |
+
+Operations that act on earlier features (`boolean`, the patterns, `mirror`, `bend`, `edge_flange`, `weld_bead`) list them in `targets`. **Sheet metal:** when the sheet has a flat pattern (an unfolded blank, usually with `BEND UP` / `BEND DOWN` callouts or bend lines), model the part as a `base_flange` (the flat blank outline from the flat pattern, `thickness`, plus `radius` and `k_factor` from the notes) followed by one `bend` per bend line, in folding order outward from the panel that stays flat. A bend line drawn on a flat pattern is the **middle of the bend zone**: the zone, `radians(angle) * (radius + k_factor * thickness)` long, is centred on it. Add `fixed`, a point `[x, y]` inside the panel that stays flat, to the `base_flange` params. **A sheet-metal part drawn only formed** (no flat pattern) is not built from `base_flange` + `bend`, since there is no blank to fold: model it from its views as plates, `extrude_boss` of the base plate's outline from the top view, and each bent wall as the side view's sheet profile (the drawn line, thickness wide, with its bend radii) extruded across the width; recesses as `extrude_cut` + the formed floor. **The sheet thickness** comes from the notes (`SHEET THICKNESS 3`, `t=2`, `GAUGE`) or from a tab or wall seen edge-on, measured; never from a dimension that happens to be small. On a `base_flange` part, holes are `hole` features at their **flat** positions on the blank `[x, y, 0]` (the builder cuts them before folding, so they move with their panel); on a part drawn formed, at their 3D positions.
 
 - `params`: the values, in mm and degrees, named as in the schema: `d`, `depth` or `thru`, `cbore_d`, `cbore_depth`, `csk_d`, `csk_angle`, `thread`, `width`, `length`, `height`, `r`, `size`, `profile`.
 - `on`, `position` `[x, y, z]`, `direction`: where the feature starts and which way it goes, in the part frame. **Every feature needs a position**, given as numbers, never only in the text of `on`.
@@ -99,7 +131,7 @@ Frame: Z is up, the face the part rests on is at Z = 0, and the part is centred 
 
 **Round outlines are circles.** A feature dimensioned with `Ø` (a barrel, flange, boss, bore) has a circular profile: give `d` and `profile: "circle"`, never a list of polygon points approximating it.
 
-**Every number needs a source.** A value with no evidence must be covered by an assumption (`A1`, `A2`, ... with `covers: ["F03.depth"]`); the harness rejects a tree with an uncovered number. A feature that no operation can express (gear teeth, sheet-metal bends, engraving) goes in `unsupported`, not in the tree.
+**Every number needs a source.** A value with no evidence must be covered by an assumption (`A1`, `A2`, ... with `covers: ["F03.depth"]`); the harness rejects a tree with an uncovered number. A feature that no operation can express (gear teeth, engraving) goes in `unsupported`, not in the tree. **Unsupported is only for that.** A notch, step, slot, recess or any cut into an outline, however irregular, is an `extrude_cut` with its profile as points (on a turned part, cut from the rim with `direction` along the axis, or across it); a bend is a `bend`; a raised or recessed ring is a `revolve_boss` / `revolve_cut`. If you can draw its outline in one view and say how deep it goes, it goes in the tree, with assumptions for what the drawing does not give.
 
 # Revisions
 
