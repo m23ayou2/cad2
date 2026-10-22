@@ -53,12 +53,12 @@ import validate as view_checks  # noqa: E402
 import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
-MODEL = os.getenv("D2C_MODEL") or "openai/gpt-6-luna"  # the web interface sets D2C_MODEL per job
+MODEL = os.getenv("D2C_MODEL") or "anthropic/claude-haiku-5.5"  # the web interface sets D2C_MODEL per job
 # Scanned drawings (no vector geometry, no text layer) take another path: VISION_MODEL reads the sheet (views,
 # parts outlined directly, parts matched across views; src/part_views.py); then the planner and the validation
 # agents run on SCAN_REASON_MODEL, and the builder on the cheap SCAN_BUILD_MODEL.
-VISION_MODEL = os.getenv("D2C_VISION_MODEL") or "anthropic/claude-opus-5.5"
-SCAN_REASON_MODEL = os.getenv("D2C_SCAN_REASON_MODEL") or "anthropic/claude-sonnet-5.5"
+VISION_MODEL = os.getenv("D2C_VISION_MODEL") or "anthropic/claude-haiku-5.5"
+SCAN_REASON_MODEL = os.getenv("D2C_SCAN_REASON_MODEL") or "anthropic/claude-haiku-5.5"
 SCAN_BUILD_MODEL = os.getenv("D2C_SCAN_BUILD_MODEL") or "anthropic/claude-haiku-5.5"
 # A scan's budget for planning, building and validation (USD), on top of what the vision model costs: the reasoning
 # model costs far more per call than the vector path's, whose budget is agents/main.md's max_cost_usd.

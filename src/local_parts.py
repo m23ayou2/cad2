@@ -477,8 +477,9 @@ def absorb_bends(ref: dict, g: dict, fmap: dict) -> None:
         g["adj"][x].add(y)
         g["adj"][y].add(x)
         g["bends"][frozenset((x, y))] = {"region": u}
-        g["contact"][(x, y)] = _contact(g["by_id"][x]["mask"], g["by_id"][u]["mask"])
-        g["contact"][(y, x)] = _contact(g["by_id"][y]["mask"], g["by_id"][u]["mask"])
+        # u may be a neighbour through a bend region rather than by touching: keep face_graph's contact points
+        g["contact"][(x, y)] = g["contact"][(x, u)]
+        g["contact"][(y, x)] = g["contact"][(y, u)]
         used.add(u)
 
 

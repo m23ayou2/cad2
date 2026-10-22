@@ -12,3 +12,4 @@ runs/
 /.scratch/
 /data/
 /evals/
+uv.lock
