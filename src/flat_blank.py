@@ -32,10 +32,11 @@ MAX_ASPECT = 0.08  # the two bounding-box scales may differ by this share at mos
 
 def flat_pattern(parts_dir: Path) -> dict | None:
     """The cleanest flat view's blank in its own PDF points: {"view", "outline", "bends": [(p, q)], "holes":
-    [(centre, d)], "panels": [polygon]}, or None when no flat view has panels."""
+    [(centre, d)], "panels": [polygon]}, or None when no flat-pattern view has panels. Only views the vision model
+    labelled flat_pattern count: an orthographic view of the formed part also has panels, and its outline is not
+    the blank."""
     views = json.loads((parts_dir / "views.json").read_text())
-    flats = [v for v in views if v["kind"] not in ("isometric", "other")
-             and any(p["feature"] == "panel" for p in v["parts"])]
+    flats = [v for v in views if v["kind"] == "flat_pattern" and any(p["feature"] == "panel" for p in v["parts"])]
     if not flats:
         return None
     # a view whose panels were moved from another is a copy; prefer the original

@@ -16,6 +16,7 @@ the flat blank, so they fold with their panel.
 from __future__ import annotations
 
 import math
+import os
 
 import cadquery as cq
 import numpy as np
@@ -203,4 +204,7 @@ def fold_sheet(profile, thickness: float, bends: list[dict], k_factor: float = 0
     if len(result.Solids()) > 1:
         log.append(f"the folded part has {len(result.Solids())} separate solids: a bend line does not reach "
                    "the panel edges, or a panel was left unfolded")
+        if os.getenv("D2C_STRICT_FOLD"):  # set for scans: keeping one of the pieces would hide the wrong fold
+            raise ValueError("the fold falls apart; fix the bend lines or `fixed`, do not keep one piece:\n"
+                             + "\n".join(log))
     return cq.Workplane("XY").add(result)

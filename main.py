@@ -495,8 +495,10 @@ def run_cadquery(ctx: Ctx, code: Annotated[str, "The complete CadQuery script; i
     script, step, report = folder / f"{name}.py", folder / f"{name}.step", folder / f"{name}.json"
     script.write_text(code, encoding="utf-8")
     try:
+        # on a scan, fold_sheet refuses a fold that falls apart instead of logging it (D2C_STRICT_FOLD)
         process = subprocess.run([sys.executable, str(ROOT / "src" / "cad_runner.py"), str(script), str(step),
-                                  str(report)], cwd=folder, timeout=CAD_TIMEOUT_S, capture_output=True, text=True)
+                                  str(report)], cwd=folder, timeout=CAD_TIMEOUT_S, capture_output=True, text=True,
+                                 env={**os.environ, "D2C_STRICT_FOLD": "1"} if run.scanned else None)
     except subprocess.TimeoutExpired:
         return {"ok": False, "attempt": run.build_attempts,
                 "error": f"The script took more than {CAD_TIMEOUT_S} s; simplify it (fewer booleans or fillets)"}
@@ -716,6 +718,14 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
                   tool_calls=[{"name": c.function.name, "arguments": c.function.arguments} for c in calls])
 
         if not calls:
+            if run.scanned and schemas and not last and "{" not in (message.content or ""):
+                # prose with no JSON (a scan's planner writing its step-1 overview) is not a final answer: go on
+                alog.info("turn %d: prose, no JSON; asking to go on with the tools", turn)
+                run.trace("nudged", agent=label, turn=turn)
+                messages += [{"role": "assistant", "content": message.content or ""},
+                             {"role": "user", "content": "Go on with the next step, using your tools. Reply with "
+                                                         "the final JSON object only when you are done."}]
+                continue
             try:
                 result = parse_json(message.content or "")
                 if agent.output_model:
