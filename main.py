@@ -41,7 +41,7 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_typ
 import pymupdf
 import yaml
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -54,9 +54,10 @@ import visualization  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 MODEL = os.getenv("D2C_MODEL") or "anthropic/claude-haiku-5.5"  # the web interface sets D2C_MODEL per job
-# Scanned drawings (no vector geometry, no text layer) take another path: VISION_MODEL reads the sheet (views,
-# parts outlined directly, parts matched across views; src/part_views.py); then the planner and the validation
-# agents run on SCAN_REASON_MODEL, and the builder on the cheap SCAN_BUILD_MODEL.
+# Scanned drawings (no vector geometry, no text layer) take another path: VISION_MODEL finds the views; a sheet
+# with a flat pattern goes through the parts route (parts outlined, matched across views; src/part_views.py), any
+# other through the views route (the view subagents on the cropped views; src/scan_views.py); then the planner and
+# the validation agents run on SCAN_REASON_MODEL, and the builder on the cheap SCAN_BUILD_MODEL.
 VISION_MODEL = os.getenv("D2C_VISION_MODEL") or "anthropic/claude-haiku-5.5"
 SCAN_REASON_MODEL = os.getenv("D2C_SCAN_REASON_MODEL") or "anthropic/claude-haiku-5.5"
 SCAN_BUILD_MODEL = os.getenv("D2C_SCAN_BUILD_MODEL") or "anthropic/claude-haiku-5.5"
@@ -66,6 +67,12 @@ SCAN_MAX_COST_USD = float(os.getenv("D2C_SCAN_MAX_COST") or 3.0)
 # How a scan's parts are found: "local" = image processing segments and matches them and one MODEL call reviews
 # the groups (src/local_llm_match.py); "llm" = VISION_MODEL outlines and matches them (src/part_views.py).
 SCAN_PARTS = os.getenv("D2C_SCAN_PARTS") or "local"
+# On a scan, a model call that fails with one of these is tried again after each wait (s): a scan's run is long,
+# and its views pipeline costly to redo. A vector drawing's call is made once.
+RETRYABLE = (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
+SCAN_RETRY_WAITS_S = (15, 60, 180)
+# Views route: the built part may differ this much (share of each overall size) from the plan's envelope.
+ENVELOPE_TOLERANCE = 0.10
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -145,6 +152,8 @@ class Run:
     build_attempts: int = 0
     cross_check: dict | None = None  # conflicts between the view analyses and the arbiter's rulings
     scanned: bool = False  # no vector geometry: the vision model reads the sheet (plan_from_parts)
+    scan_route: str | None = None  # a scan's route: "parts" (a flat pattern on the sheet) or "views"
+    last_size: list[float] | None = None  # bounding box of the last model built, mm
 
     def __post_init__(self):
         self.build_attempts = len(list((self.dir / "build").glob("attempt_*.py")))  # continue on --build
@@ -249,6 +258,8 @@ def read_drawing_text(ctx: Ctx) -> dict:
 def split_views(ctx: Ctx) -> ToolOutput:
     """Find the views on the sheet, save each one, and summarise what was extracted from each."""
     run = ctx.run
+    if run.scan_route == "views":
+        return split_scan_views(run)
     out_dir = run.dir / "views"
     try:
         splitter.split(str(run.drawing), str(out_dir))
@@ -271,6 +282,48 @@ def split_views(ctx: Ctx) -> ToolOutput:
     run.trace("split", ok=True, views=listing)
     overview = (out_dir / f"{run.drawing.stem}_overview.png").read_bytes()
     return ToolOutput({"views": listing, "sheet_info_texts": meta.get("sheet_info_texts", [])},
+                      [("Sheet with the detected views boxed and numbered", overview)])
+
+
+SCAN_SPLIT_NOTE = ("Scanned drawing: no text layer. `axes`, where given, were worked out from the dimension values "
+                   "each view shares with the others: use them. The names and suggested subagents are a vision "
+                   "model's guesses; for a view without `axes`, work them out from the layout and pass them to its "
+                   "subagent in `context`.")
+
+
+def split_scan_views(run: Run) -> ToolOutput:
+    """split_views on the views route: the views the vision model boxed, already cropped into their own PDFs with
+    their axes worked out (src/scan_views.py, run by plan_from_views)."""
+    import src.scan_views as scan_views
+    found = json.loads((run.dir / "parts" / "views_found.json").read_text())
+    axes = json.loads((run.dir / "parts" / "axes.json").read_text())
+    with pymupdf.open(run.drawing) as doc:
+        sizes = {i + 1: (p.rect.width, p.rect.height) for i, p in enumerate(doc)}
+    run.views, listing = {}, []
+    for v in found:
+        w, h = sizes[v["sheet"]]
+        x0, y0, x1, y1 = v["rect_pt"]
+        pdf = run.dir / "views" / f"{v['id']}.pdf"
+        view = View(v["id"], v["name"] or v["id"], pdf, pdf.with_suffix(".png"),
+                    scan_views.subagent(v["kind"], v["name"]),
+                    frame=scan_views.view_frame(axes[v["id"]]) if v["id"] in axes else None,
+                    sheet_box=[x0 / w, y0 / h, x1 / w, y1 / h], outline_pt=v["rect_pt"])
+        run.views[view.id] = view
+        item = {"id": view.id, "label": view.label, "kind": v["kind"], "suggested_subagent": view.suggested_subagent,
+                "sheet": v["sheet"], "sheet_box_fraction": [round(c, 3) for c in view.sheet_box]}
+        if view.frame:
+            item["axes"] = view.frame
+        listing.append(item)
+    with pymupdf.open(run.drawing) as doc:  # the first sheet with the views boxed and numbered, in memory only
+        page = doc[0]
+        for v in found:
+            if v["sheet"] == 1:
+                r = pymupdf.Rect(v["rect_pt"])
+                page.draw_rect(r, color=(0.85, 0.1, 0.1), width=2)
+                page.insert_text((r.x0 + 4, r.y0 + 18), v["id"], fontsize=18, color=(0.85, 0.1, 0.1))
+        overview = png_of(page)
+    run.trace("split", ok=True, views=listing)
+    return ToolOutput({"views": listing, "note": SCAN_SPLIT_NOTE},
                       [("Sheet with the detected views boxed and numbered", overview)])
 
 
@@ -455,6 +508,7 @@ def run_cadquery(ctx: Ctx, code: Annotated[str, "The complete CadQuery script; i
     if result.get("ok"):
         shutil.copyfile(script, run.dir / "model.py")
         shutil.copyfile(step, run.dir / "model.step")
+        run.last_size = result["bbox"]["size"]
         log.getChild("cad").info("attempt %d ok: size %s, volume %s", run.build_attempts,
                                  result["bbox"]["size"], result["volume"])
     else:
@@ -607,6 +661,19 @@ def agent_model(agent: Agent, run: Run) -> str:
     return SCAN_BUILD_MODEL if agent.name == "builder" else SCAN_REASON_MODEL
 
 
+def call_model(run: Run, **kwargs):
+    """One chat completion. On a scan, a call that fails with a RETRYABLE error is tried again after each of
+    SCAN_RETRY_WAITS_S; a vector drawing's call is made once."""
+    for wait in (*(SCAN_RETRY_WAITS_S if run.scanned else ()), None):
+        try:
+            return run.client.chat.completions.create(**kwargs)
+        except RETRYABLE as error:
+            if wait is None:
+                raise
+            log.warning("model call failed (%s); retrying in %d s", type(error).__name__, wait)
+            time.sleep(wait)
+
+
 def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = None) -> dict:
     """Run one agent until it replies with JSON; return the parsed JSON."""
     run, label = ctx.run, label or agent.name
@@ -629,8 +696,8 @@ def run_agent(agent: Agent, ctx: Ctx, content: list[dict], label: str | None = N
         if "temperature" in agent.settings:
             kwargs["temperature"] = agent.settings["temperature"]
         t0 = time.monotonic()
-        reply = run.client.chat.completions.create(model=agent_model(agent, run), messages=messages,
-                                                   extra_body={"usage": {"include": True}}, **kwargs)
+        reply = call_model(run, model=agent_model(agent, run), messages=messages,
+                           extra_body={"usage": {"include": True}}, **kwargs)
         usage = reply.usage.model_dump() if reply.usage else {}
         cost = usage.get("cost")
         if cost is None:
@@ -794,7 +861,7 @@ def apply_extensions(tree: dict) -> list[str]:
 def save_plan(run: Run, result: dict) -> dict:
     for note in apply_extensions(result["feature_tree"]):
         log.info("  extension: %s", note)
-    if run.scanned:  # a sheet-metal blank: outline, bend lines and hole centres from the scan's own flat pattern
+    if run.scan_route == "parts":  # a sheet-metal blank: outline, bend lines and hole centres from the flat pattern
         import flat_blank
         notes = flat_blank.snap_blank(result["feature_tree"], run.dir / "parts")
         for note in notes:
@@ -877,26 +944,73 @@ the builder folds it with `fold_sheet`. Use the groups to fill it in:
 
 The images follow: all views coloured by group (same colour = same group in every view), then each view alone."""
 
+# Appended to agents/main.md on the views route (a scan with no flat pattern), and BUILD_PLATES to agents/builder.md
+SCAN_VIEWS_BRIEF = """# Scanned drawing, no flat pattern
+
+This drawing is a scan: there is no text layer. Read every value from the images (the view subagents zoom into
+their view; you can zoom with `view_drawing`). `split_views` gives each view's `axes` when the harness could work
+them out from the dimension values the view shares with other views (a view drawn turned on the sheet is caught
+this way): use them, they override the view names, which a vision model guessed. For a view without `axes`,
+decide them from the layout (views drawn one above the other share their horizontal axis, views side by side
+share their vertical axis) and the isometric, and give them to its subagent in `context`.
+
+## Thin-walled parts are built from plates
+
+If the part is made of walls of one thickness (sheet metal drawn formed, a welded bracket), there is no blank to
+fold: build it as flat plates.
+1. Find the plates. A plate shows as a strip of constant width in two views (that width is the thickness) and at
+   full size in the third. Read the thickness from the dimensions on both sides of such a strip (ordinates 20
+   and 23: 3 mm) or a dimension across it; never assume it.
+2. One `extrude_boss` per plate. `profile`: its outline in the view that shows it at full size, in that view's
+   axes: direction +Z: [[x, y], ...]; +Y: [[x, z], ...]; +X: [[y, z], ...]. `height`: the thickness.
+   `position`: [x, y, z] with the plate's lower face on its axis (a plate from y = 20 to 23 with direction +Y
+   has position y = 20). Take the outline points from that view's dimensions, with enough points to follow
+   arcs (R...) and angled edges; a plate standing on another one starts at that one's face.
+3. A wall whose edge follows another plate's outline (its top along a sloped edge drawn in another view) can be
+   given a straight edge at the dimensioned height; say so in an assumption.
+4. Holes, windows and notches: `hole` / `extrude_cut` in the view that shows them at full size.
+5. Never put a wall, gusset, flange or plate in `unsupported`: approximate it and add an assumption.
+
+## Envelope
+
+`overview.envelope_mm`: the overall size of the finished part along X, Y and Z, from the overall dimensions of
+the views. The built part is checked against it."""
+
+BUILD_PLATES = """# Profiles drawn in other planes
+
+An `extrude_boss` or `extrude_cut` whose direction is along X or Y has its profile in that view's axes. Build it
+with the helper, never with a hand-made workplane (CadQuery's "XZ" workplane extrudes towards -Y):
+
+    from plates import plate
+    wall = plate(F04_PROFILE, direction="+Y", start=20.0, thickness=3.0)  # profile [[x, z], ...]: fills y 20..23
+
+direction "+Z"/"-Z": profile [[x, y], ...]; "+Y"/"-Y": [[x, z], ...]; "+X"/"-X": [[y, z], ...]. `start` is the
+feature's position along that axis. For a through cut, start well outside the part with a large thickness."""
+
 
 def plan_from_parts(run: Run) -> dict:
     """Scanned drawing: the vision model reads it (src/part_views.py, saved in parts/), then the main agent plans
-    the feature tree from the matched groups, with only the sheet as a tool."""
+    the feature tree from the matched groups, with only the sheet as a tool. With SCAN_PARTS "local", a sheet with
+    no flat pattern among its views goes to the views route instead (plan_from_views)."""
     import src.llm as llm
     import src.part_views as part_views
     llm.VISION_MODEL, llm.MODEL, part_views.VISION_MODEL = VISION_MODEL, MODEL, VISION_MODEL
     part_views.PARTS_METHOD = "direct"
+    run.scan_route = "parts"
     parts_dir = run.dir / "parts"
     t0 = time.monotonic()
     if SCAN_PARTS == "local":
         # the model only finds the views; their parts are segmented and matched locally (src/local_parts.py),
         # and one call reviews the groups (src/local_llm_match.py)
         from src.local_llm_match import scan_parts
-        log.info("scanned drawing: views found by %s, parts segmented and matched locally, groups reviewed by %s",
-                 VISION_MODEL, MODEL)
         (parts_dir / "views").mkdir(parents=True, exist_ok=True)
         with pymupdf.open(run.drawing) as doc:
             found = part_views.find_views(doc, parts_dir, parts_dir / "trace.jsonl")
         (parts_dir / "views_found.json").write_text(json.dumps(found, indent=2))
+        if not any(v["kind"] == "flat_pattern" for v in found):
+            return plan_from_views(run, found)
+        log.info("scanned drawing: views found by %s, parts segmented and matched locally, groups reviewed by %s",
+                 VISION_MODEL, MODEL)
         scan_parts(run.drawing, parts_dir, parts_dir / "views_found.json", model=MODEL)
     else:
         log.info("scanned drawing: reading the views with %s (views, parts, matching)", VISION_MODEL)
@@ -945,6 +1059,48 @@ def plan_from_parts(run: Run) -> dict:
     return save_plan(run, {**result, "summaries": [], "cross_check": None, "parts": "parts/matches.json"})
 
 
+def plan_from_views(run: Run, found: list[dict]) -> dict:
+    """The views route: a scan with no flat pattern is planned like a vector drawing, by the main agent and the
+    view subagents, on the views the vision model boxed. src/scan_views.py crops them, transcribes their dimension
+    values and works out their axes; split_views hands them out. The planner also gets SCAN_VIEWS_BRIEF and states
+    the part's envelope, which the built part is checked against (envelope_issues)."""
+    import src.scan_views as scan_views
+    run.scan_route = "views"
+    parts_dir = run.dir / "parts"
+    t0 = time.monotonic()
+    axes = scan_views.prepare(run.drawing, run.dir, found, model=VISION_MODEL)
+    calls = [json.loads(line) for line in (parts_dir / "trace.jsonl").read_text().splitlines()]
+    cost = sum(c.get("cost") or 0 for c in calls)
+    run.cost_usd += cost
+    run.max_cost_usd += cost  # as on the parts route: the planner's budget is its own
+    run.cost_unknown_calls += sum(1 for c in calls if c.get("cost") is None)
+    run.trace("scan_views", model=VISION_MODEL, calls=len(calls), cost_usd=cost,
+              seconds=round(time.monotonic() - t0, 1), views=[v["name"] for v in found], axes=axes)
+    log.info("scanned drawing, no flat pattern: views route, %d view(s), cost $%.4f", len(found), cost)
+    for view_id, a in axes.items():
+        log.info("  %s axes: right %s, up %s (%s)", view_id, a["horizontal"], a["vertical"], a["evidence"])
+    content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}. Start with step 1."}]
+    result = run_agent(scan_planner(), Ctx(run), content, label="main[scan views]")
+    return save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check,
+                           "scan_route": "views"})
+
+
+def scan_planner() -> Agent:
+    """The main agent on the views route: SCAN_VIEWS_BRIEF, and an answer that states the part's envelope."""
+    agent = load_agent("main")
+    agent.prompt += "\n\n" + SCAN_VIEWS_BRIEF
+    agent.settings = {**agent.settings, "output_schema": "ScanPartPlan"}
+    return agent
+
+
+def builder_agent(run: Run) -> Agent:
+    """The builder; on the views route it also gets the plate() helper (BUILD_PLATES)."""
+    agent = load_agent("builder")
+    if run.scan_route == "views":
+        agent.prompt += "\n\n" + BUILD_PLATES
+    return agent
+
+
 def plan(run: Run) -> dict:
     """Main agent + view subagents -> feature tree (feature_tree.json, plan.json); a scan goes through
     plan_from_parts instead."""
@@ -957,7 +1113,7 @@ def plan(run: Run) -> dict:
 
 def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | None, round_no: int) -> dict:
     """Main agent again, without splitting or re-analysing: fix the plan issues found by validation."""
-    agent = load_agent("main")
+    agent = scan_planner() if run.scan_route == "views" else load_agent("main")
     agent.settings = {**agent.settings, "tools": ["view_drawing", "read_drawing_text"]}
     summaries = {}
     for s in plan_result.get("summaries", []):
@@ -1001,13 +1157,13 @@ def build(run: Run, plan_result: dict, corrections: dict | None = None) -> dict:
                  "and change nothing else.\n\n## Build issues\n```json\n"
                  + json.dumps(corrections["issues"], indent=1, ensure_ascii=False)
                  + "\n```\n\n## Previous script\n```python\n" + corrections["previous_script"] + "\n```")
-    report = run_agent(load_agent("builder"), Ctx(run), [{"type": "text", "text": text}])
+    report = run_agent(builder_agent(run), Ctx(run), [{"type": "text", "text": text}])
     step = run.dir / "model.step"
     if not step.is_file():  # one more try, told why the last one failed
         log.info("build: no valid solid; asking the builder once more")
         failed = {"notes": report.get("notes", []),
                   "features": [{k: f.get(k) for k in ("id", "state", "note")} for f in report.get("features", [])]}
-        report = run_agent(load_agent("builder"), Ctx(run), [{"type": "text", "text": text + (
+        report = run_agent(builder_agent(run), Ctx(run), [{"type": "text", "text": text + (
             "\n\n# Your previous attempt failed\n\nIt produced no valid single solid. Its report:\n```json\n"
             + json.dumps(failed, indent=1, ensure_ascii=False) + "\n```\nFind the cause and fix it; do not give up "
             "while a different construction could still give one connected solid.")}], label="builder[retry]")
@@ -1227,6 +1383,27 @@ def round_rank(r: dict):
     return r["high_issues"], -r["drawn_covered"], -r["round"]
 
 
+def envelope_issues(run: Run, plan_result: dict) -> list[dict]:
+    """Views route: the built part against the overall size the planner read (overview.envelope_mm). Sizes are
+    sorted, so a frame mix-up alone passes; a part built flat, a wall left out or a panel folded the wrong way
+    does not. Any other run: no issue."""
+    want = (plan_result.get("overview") or {}).get("envelope_mm")
+    if run.scan_route != "views" or not want or not run.last_size:
+        return []
+    got, want = [round(v, 1) for v in sorted(run.last_size)], [round(v, 1) for v in sorted(want)]
+    off = [abs(g - w) / w for g, w in zip(got, want) if w > 0]
+    if not off or max(off) <= ENVELOPE_TOLERANCE:
+        return []
+    log.warning("envelope: the model measures %s mm, the plan's envelope is %s mm", got, want)
+    return [{"kind": "wrong_size", "severity": "high", "owner": "plan", "feature": None,
+             "description": f"The built part measures {got} mm overall (sorted); the overall size you read from "
+                            f"the drawing is {want} mm.",
+             "drawing": f"overall size {want} mm (overview.envelope_mm)", "model": f"overall size {got} mm",
+             "fix": "Find the walls, plates or bodies the model lacks, or the feature that is too large, and fix "
+                    "them; do not leave a wall in `unsupported`.",
+             "evidence": [], "basis": "measured: bounding box of the built part"}]
+
+
 def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     """Plan, build, validate and correct a drawing in a new run folder, or rebuild an existing run's plan."""
     max_cost = float(load_agent("main").settings.get("max_cost_usd", 1.0))
@@ -1241,6 +1418,8 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
         plan_result["feature_tree"] = json.loads((rebuild / "feature_tree.json").read_text(encoding="utf-8"))
         drawing = Path(json.loads((rebuild / "trace.jsonl").open().readline())["drawing"])
         run = open_run(drawing, rebuild, max_cost)
+        if scanned:
+            run.scan_route = plan_result.get("scan_route", "parts")
         if (run.dir / "views" / f"{run.drawing.stem}_views.json").is_file():
             index_views(run)
     else:
@@ -1270,16 +1449,18 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
             if not (run.dir / "model.step").is_file():
                 break
             check = validate(run, plan_result, round_no)
-            issues = [i for r in check["reports"] for i in r["issues"]]
+            gate = envelope_issues(run, plan_result)
+            issues = [i for r in check["reports"] for i in r["issues"]] + gate
             escalate(issues, sent_to)
             high = [i for i in issues if i["severity"] == "high"]
             covered = [m["drawn_covered"] for m in check["measured"]]
             rounds.append({"round": round_no, "build": report["status"], "high_issues": len(high),
                            "validated_views": len(check["reports"]), "measured_views": len(covered),
                            "drawn_covered": round(sum(covered) / len(covered), 3) if covered else 0.0,
-                           "verdicts": {r["view"]: r["verdict"] for r in check["reports"]}})
+                           "verdicts": {r["view"]: r["verdict"] for r in check["reports"]},
+                           **({"envelope_ok": not gate} if run.scan_route == "views" else {})})
             mark_features(run, plan_result, check, high)
-            if not check["reports"]:
+            if not check["reports"] and not gate:
                 break
             if not high:
                 log.info("validation: no high-severity issue in round %d", round_no)
@@ -1308,7 +1489,8 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     out.write_text(json.dumps({
         "drawing": str(drawing), "model": SCAN_REASON_MODEL if run.scanned else MODEL,
         "models": ({"vision": VISION_MODEL, "reasoning": SCAN_REASON_MODEL, "builder": SCAN_BUILD_MODEL}
-                   if run.scanned else {"all": MODEL}), "status": final["build"] if final else report["status"],
+                   if run.scanned else {"all": MODEL}), **({"scan_route": run.scan_route} if run.scanned else {}),
+        "status": final["build"] if final else report["status"],
         "validated": bool(final and final["measured_views"]),  # judged by eye only does not count
         "measured_views": final["measured_views"] if final else 0,
         "drawn_covered": final["drawn_covered"] if final else None,

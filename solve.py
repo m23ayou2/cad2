@@ -145,7 +145,7 @@ class Jobs:
                 record = json.loads(line)
                 if record.get("event") == "llm":
                     cost += (record.get("usage") or {}).get("cost") or 0
-                elif record.get("event") == "parts_pipeline":
+                elif record.get("event") in ("parts_pipeline", "scan_views"):
                     cost += record.get("cost_usd") or 0
             job["cost_usd"] = round(cost, 4)
         if run and (run / "result.json").is_file():
@@ -381,6 +381,15 @@ def steps(run: Path, running: bool) -> dict:
                         "details": [f"{len(r.get('views', []))} view(s): " + ", ".join(r.get("views", [])),
                                     f"{r.get('parts')} part(s) outlined, matched into {len(r.get('groups', []))} group(s): "
                                     + ", ".join(str(g) for g in r.get("groups", []))]})
+        elif event == "scan_views":
+            axes = r.get("axes") or {}
+            out.append({"title": f"Read the scanned drawing with {str(r.get('model', '')).split('/')[-1]}",
+                        "status": "done", "t0": t - timedelta(seconds=r.get("seconds") or 0) if t else None, "t1": t,
+                        "cost": r.get("cost_usd"),
+                        "details": [f"{len(r.get('views', []))} view(s): " + ", ".join(r.get("views", [])),
+                                    "No flat pattern: planned from the views. Axes worked out for "
+                                    + (", ".join(f"{k} (right {a.get('horizontal')}, up {a.get('vertical')})"
+                                                 for k, a in axes.items()) or "no view")]})
         elif event == "projections":
             views = ((r.get("data") or {}).get("views")) or []
             out.append({"title": f"Project the model into every view (round {r.get('round')})", "status": "done",

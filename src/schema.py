@@ -368,6 +368,18 @@ class PartPlan(Strict):
     uncertainties: list[str] = Field(default_factory=list)
 
 
+class ScanOverview(Overview):
+    envelope_mm: list[float] = Field(min_length=3, max_length=3, description=(
+        "Overall size of the finished part along X, Y and Z of your frame, in mm, from the drawing's overall "
+        "dimensions (all views together). The harness checks the built part against it."))
+
+
+class ScanPartPlan(PartPlan):
+    """The main agent's answer on a scan planned from its views (no flat pattern): it also states the part's
+    envelope, which the built part is checked against."""
+    overview: ScanOverview
+
+
 class BuiltFeature(Strict):
     id: str = Field(pattern=r"^F\d{2}$")
     state: Literal["built", "approximated", "skipped"]
@@ -485,5 +497,5 @@ class CornerCheck(Strict):
 
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
-    FeatureTree, PartPlan, BuildReport, ValidationReport, ArbiterReport, CornerCheck,
+    FeatureTree, PartPlan, ScanPartPlan, BuildReport, ValidationReport, ArbiterReport, CornerCheck,
 )}
