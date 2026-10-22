@@ -380,6 +380,14 @@ class ScanPartPlan(PartPlan):
     overview: ScanOverview
 
 
+class ShapeCheck(Strict):
+    """The shape check's answer (agents/shape_check.md): the plan's bodies against the isometric views'."""
+    plan_bodies: list[str] = Field(description="What the plan builds, a few words each, with counts")
+    drawn_bodies: list[str] = Field(description="What the isometric views show, a few words each, with counts")
+    issues: list["Issue"] = Field(description="One per difference that changes the overall shape")
+    notes: list[str] = Field(default_factory=list)
+
+
 class BuiltFeature(Strict):
     id: str = Field(pattern=r"^F\d{2}$")
     state: Literal["built", "approximated", "skipped"]
@@ -497,5 +505,5 @@ class CornerCheck(Strict):
 
 MODELS: dict[str, type[BaseModel]] = {m.__name__: m for m in (
     FrontSummary, TopSummary, SideSummary, SectionSummary, DetailSummary, IsometricSummary,
-    FeatureTree, PartPlan, ScanPartPlan, BuildReport, ValidationReport, ArbiterReport, CornerCheck,
+    FeatureTree, PartPlan, ScanPartPlan, ShapeCheck, BuildReport, ValidationReport, ArbiterReport, CornerCheck,
 )}

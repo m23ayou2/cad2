@@ -73,6 +73,11 @@ RETRYABLE = (APIConnectionError, APITimeoutError, InternalServerError, RateLimit
 SCAN_RETRY_WAITS_S = (15, 60, 180)
 # Views route: the built part may differ this much (share of each overall size) from the plan's envelope.
 ENVELOPE_TOLERANCE = 0.10
+# Views route, opt-in: the planner and the builder also get the layers recipe for machined parts (D2C_SCAN_LAYERS=1)
+SCAN_LAYERS = os.getenv("D2C_SCAN_LAYERS") == "1"
+# Views route, opt-in: before building, the plan's overall shape is checked against the isometric views
+# (agents/shape_check.md), and the planner revises it on a mismatch (D2C_SCAN_SHAPE_CHECK=1)
+SCAN_SHAPE_CHECK = os.getenv("D2C_SCAN_SHAPE_CHECK") == "1"
 AGENTS_DIR = ROOT / "agents"
 RUNS_DIR = ROOT / "runs"
 REPAIR_TURNS = 2
@@ -997,6 +1002,46 @@ with the helper, never with a hand-made workplane (CadQuery's "XZ" workplane ext
 direction "+Z"/"-Z": profile [[x, y], ...]; "+Y"/"-Y": [[x, z], ...]; "+X"/"-X": [[y, z], ...]. `start` is the
 feature's position along that axis. For a through cut, start well outside the part with a large thickness."""
 
+# With SCAN_LAYERS: LAYERS_BRIEF after SCAN_VIEWS_BRIEF, BUILD_LAYERS after BUILD_PLATES
+LAYERS_BRIEF = """# Machined parts are built in Z layers
+
+A machined, cast or milled part (walls of different thicknesses, pockets, channels, bores) is a stack of Z layers;
+in each layer the material is one plan region. Plan it that way:
+1. List the Z levels from the elevations and sections: the top, every floor, step and recess bottom (a dimension
+   "28" down from a top at 40 puts a floor at 12; a "12" up from the bottom is a level at 12).
+2. For each layer between two levels, decide which plan region is material: the plan outline, minus what the
+   sections and end views show open at that height (a channel between two walls, a bore, a recess from below).
+   Two widths across the same feature (85 outside, 61 inside) give its walls: (85 - 61) / 2 = 12; check it
+   against the wall thickness the sections print.
+3. Features: one `extrude_boss` per material layer (its plan region; `position` z = the layer's bottom, `height`
+   = its thickness), then `extrude_cut` for what is open, each over its own Z range, then holes and slots.
+4. A feature drawn at an angle (an arm along a line dimensioned at an angle) is a rectangle in a turned frame:
+   `profile` "rectangle", `angle` = the line's direction in degrees counterclockwise from +X, `along` = [s0, s1]
+   (distances along the line from the frame's origin, e.g. [0, 81.43] from the centre to the arm's end) and
+   `across` = [t0, t1] (square to the line, + to its left), with the frame's origin in `position`. Do not compute
+   corner coordinates yourself. Slots on such a line: `along`/`across` of their two end centres, and `width`.
+5. A part symmetric left-right: plan the right half and give the feature `pattern` {"type": "mirror"} about
+   the YZ plane.
+6. Lugs or bosses joined to the outline by "R5 TYP" fillets: add `fillet_r` 5 to the outline feature."""
+
+BUILD_LAYERS = """# Layers and turned frames
+
+For a plan built in Z layers, or with features drawn at an angle (`angle`, `along`, `across`), use layers.py:
+build every layer's plan region in 2D, cut what is open in that layer in 2D too, then extrude all layers at once.
+
+    from layers import circle, frame_point, frame_rect, minus, mirror_x, round_inside, slot, stack, union
+    arm = frame_rect(along=(0, 81.43), across=(-42.7, 42.7), angle=15.37)   # origin (0, 0) unless given
+    arms = union(arm, mirror_x(arm))                                         # mirror pattern about YZ
+    outline = round_inside(union(arms, circle(0, 0, 50)), 5)                 # fillet_r 5
+    slot_r = slot(frame_point(62.4, -26, 15.37), frame_point(62.4, 26, 15.37), 8)
+    result = stack([(0, 10, minus(arms, circle(0, 0, 50))),                 # (z0, z1, region), bottom up
+                    (10, 40, minus(outline, circle(0, 0, 38), slot_r))])
+
+Regions: rect(x0, y0, x1, y1), circle(cx, cy, r), polygon(points), slot(p0, p1, width), frame_rect, union,
+minus, mirror_x, round_inside(region, r). A layer region must be the material of that layer: subtract the
+channels, bores, slots and holes that are open in it. Split a layer where a cut starts (a slot from Z 4 up:
+layers 0..4 and 4..10)."""
+
 
 def plan_from_parts(run: Run) -> dict:
     """Scanned drawing: the vision model reads it (src/part_views.py, saved in parts/), then the main agent plans
@@ -1091,23 +1136,61 @@ def plan_from_views(run: Run, found: list[dict]) -> dict:
         log.info("  %s axes: right %s, up %s (%s)", view_id, a["horizontal"], a["vertical"], a["evidence"])
     content = [{"type": "text", "text": f"Drawing file: {run.drawing.name}. Start with step 1."}]
     result = run_agent(scan_planner(), Ctx(run), content, label="main[scan views]")
-    return save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check,
-                           "scan_route": "views"})
+    plan_result = save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check,
+                                  "scan_route": "views"})
+    if SCAN_SHAPE_CHECK:
+        issues = shape_check(run, plan_result)
+        if issues:
+            plan_result = revise_plan(run, plan_result, issues, None, 0, before_build=True)
+    return plan_result
+
+
+def shape_check(run: Run, plan_result: dict) -> list[dict]:
+    """Views route, opt-in: the plan's overall shape against the isometric views, before anything is built
+    (agents/shape_check.md, saved in shape_check.json). Returns its high-severity issues."""
+    isos = [v for v in run.views.values() if v.suggested_subagent == "isometric"]
+    if not isos:
+        return []
+    tree = plan_result["feature_tree"]
+    features = [{k: f.get(k) for k in ("id", "name", "op", "params", "position", "direction", "pattern")}
+                for f in tree["features"]]
+    seen = {s["view"]: json.loads((run.dir / s["file"]).read_text(encoding="utf-8")).get("hypotheses", [])
+            for s in run.summaries if s["agent"] == "isometric"}
+    text = ("# The plan\n```json\n" + json.dumps({"overview": plan_result.get("overview"), "features": features,
+                                                  "unsupported": tree.get("unsupported", [])},
+                                                 indent=1, ensure_ascii=False) + "\n```\n\n"
+            "# What the isometric views' subagents saw\n```json\n" + json.dumps(seen, indent=1, ensure_ascii=False)
+            + "\n```\n\nThe isometric views follow.")
+    content = [{"type": "text", "text": text}]
+    for view in isos:
+        content += [{"type": "text", "text": f"{view.label} ({view.id}):"}, image_part(view_image(view))]
+    try:
+        report = run_agent(load_agent("shape_check"), Ctx(run), content, label="shape_check")
+    except Exception as error:  # the check is a help: planning goes on without it
+        log.warning("shape check failed (%s); the plan is kept", error)
+        return []
+    (run.dir / "shape_check.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    high = [i for i in report["issues"] if i["severity"] == "high"]
+    log.info("shape check: plan %s; isometrics %s; %d high-severity issue(s)", report["plan_bodies"],
+             report["drawn_bodies"], len(high))
+    return high
 
 
 def scan_planner() -> Agent:
-    """The main agent on the views route: SCAN_VIEWS_BRIEF, and an answer that states the part's envelope."""
+    """The main agent on the views route: SCAN_VIEWS_BRIEF (and LAYERS_BRIEF with SCAN_LAYERS), and an answer that
+    states the part's envelope."""
     agent = load_agent("main")
-    agent.prompt += "\n\n" + SCAN_VIEWS_BRIEF
+    agent.prompt += "\n\n" + SCAN_VIEWS_BRIEF + ("\n\n" + LAYERS_BRIEF if SCAN_LAYERS else "")
     agent.settings = {**agent.settings, "output_schema": "ScanPartPlan"}
     return agent
 
 
 def builder_agent(run: Run) -> Agent:
-    """The builder; on the views route it also gets the plate() helper (BUILD_PLATES)."""
+    """The builder; on the views route it also gets the plate() helper (BUILD_PLATES), and the layers helper
+    (BUILD_LAYERS) with SCAN_LAYERS."""
     agent = load_agent("builder")
     if run.scan_route == "views":
-        agent.prompt += "\n\n" + BUILD_PLATES
+        agent.prompt += "\n\n" + BUILD_PLATES + ("\n\n" + BUILD_LAYERS if SCAN_LAYERS else "")
     return agent
 
 
@@ -1121,8 +1204,10 @@ def plan(run: Run) -> dict:
     return save_plan(run, {**result, "summaries": run.summaries, "cross_check": run.cross_check})
 
 
-def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | None, round_no: int) -> dict:
-    """Main agent again, without splitting or re-analysing: fix the plan issues found by validation."""
+def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | None, round_no: int,
+                before_build: bool = False) -> dict:
+    """Main agent again, without splitting or re-analysing: fix the plan issues found by validation (or, with
+    before_build, by the shape check, before anything was built)."""
     agent = scan_planner() if run.scan_route == "views" else load_agent("main")
     agent.settings = {**agent.settings, "tools": ["view_drawing", "read_drawing_text"]}
     summaries = {}
@@ -1131,8 +1216,10 @@ def revise_plan(run: Run, plan_result: dict, issues: list[dict], pose: dict | No
         if path.is_file():
             summaries[s["view"]] = json.loads(path.read_text(encoding="utf-8"))
     current = {k: plan_result[k] for k in ("overview", "feature_tree", "uncertainties") if k in plan_result}
-    text = (f"# Revision {round_no}\n\nThe part was built from your plan and checked against every view of the "
-            "drawing. The checks found the problems below in the **plan itself**. This is a revision: do not "
+    checked = ("Before building, your plan was compared with the drawing's isometric views." if before_build else
+               "The part was built from your plan and checked against every view of the drawing.")
+    text = (f"# Revision {round_no}\n\n{checked} The checks found the problems below in the **plan itself**. "
+            "This is a revision: do not "
             "split the views or call subagents again; the view summaries below are still valid. Re-read the "
             "drawing with view_drawing and read_drawing_text where the issues point. Fix these problems, keep "
             "everything else and every feature id unchanged, and reply with the complete corrected plan JSON.\n\n"
