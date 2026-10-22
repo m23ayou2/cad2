@@ -318,6 +318,7 @@ function resultText(j) {
   if (!r) return j.status === "running" || j.status === "queued" ? "–" : "No part";
   if (r.status === "failed") return "No part";
   const what = r.status === "partial" ? "Part, incomplete" : "Part built";
+  if (r.trust) return r.trust.level === "do_not_use" ? `${what}, do not use` : `${what}, check before use`;  // a scan
   return r.validated ? `${what}, checked` : `${what}, not checked`;
 }
 function fillModels(sel, key, withNotes = true) {
@@ -513,6 +514,12 @@ function verdictHtml(j) {
   const r = j.result;
   if (!r) return `<h2>Assessment</h2><p>${j.status === "stopped" ? "Stopped before a result. The steps so far are kept." : "The run ended without a result. See the full log."}</p>`;
   const lines = [];
+  if (r.trust) {  // a scan: its model is not measured against the drawing, so the trust flag stands for the check
+    const stop = r.trust.level === "do_not_use";
+    lines.push(`<p class="${stop ? "bad" : "warn"}">${stop ? "Do not use this part." : "Check this part against the drawing before use."}</p>`);
+    lines.push(`<ul>${(r.trust.reasons || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`);
+    return `<h2>Assessment</h2>${lines.join("")}`;
+  }
   if (r.status === "failed") lines.push(`<p class="bad">No valid part could be built.</p>`);
   else if (r.validated) {
     const issues = r.high_issues_left || 0, cov = r.drawn_covered;

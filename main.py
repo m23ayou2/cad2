@@ -1501,6 +1501,27 @@ def envelope_issues(run: Run, plan_result: dict) -> list[dict]:
              "evidence": [], "basis": "measured: bounding box of the built part"}]
 
 
+def scan_trust(run: Run, final: dict | None, plan_result: dict) -> dict:
+    """What a scan's result can be trusted for. A scan's model is not measured against the drawing (the
+    projection check fits each view's camera and scale, and scores a correct part about as low as a wrong one),
+    so the best a scan gets is "check": compare it with the drawing before use. "do_not_use" when no solid was
+    built or, on the views route, the part's overall size misses the size read from the drawing."""
+    blocking, warnings = [], []
+    if not final or not (run.dir / "model.step").is_file():
+        blocking.append("no valid solid was built")
+    else:
+        if final.get("envelope_ok") is False:
+            blocking.append("the part's overall size does not match the size read from the drawing")
+        if final["build"] != "built":
+            warnings.append("the builder approximated or left out some features")
+    unsupported = (plan_result.get("feature_tree") or {}).get("unsupported") or []
+    if unsupported:
+        warnings.append(f"{len(unsupported)} feature(s) the plan could not model: "
+                        + "; ".join(u["text"][:60] for u in unsupported[:3]))
+    return {"level": "do_not_use" if blocking else "check", "reasons": blocking + warnings + [
+        "a scanned drawing: the model is not measured against it; compare it with the drawing before use"]}
+
+
 def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     """Plan, build, validate and correct a drawing in a new run folder, or rebuild an existing run's plan."""
     max_cost = float(load_agent("main").settings.get("max_cost_usd", 1.0))
@@ -1586,7 +1607,8 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     out.write_text(json.dumps({
         "drawing": str(drawing), "model": SCAN_REASON_MODEL if run.scanned else MODEL,
         "models": ({"vision": VISION_MODEL, "reasoning": SCAN_REASON_MODEL, "builder": SCAN_BUILD_MODEL}
-                   if run.scanned else {"all": MODEL}), **({"scan_route": run.scan_route} if run.scanned else {}),
+                   if run.scanned else {"all": MODEL}),
+        **({"scan_route": run.scan_route, "trust": scan_trust(run, final, plan_result)} if run.scanned else {}),
         "status": final["build"] if final else report["status"],
         "validated": bool(final and final["measured_views"]),  # judged by eye only does not count
         "measured_views": final["measured_views"] if final else 0,

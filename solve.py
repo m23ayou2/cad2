@@ -114,10 +114,13 @@ class Jobs:
                 self._save(job)
             folder = JOBS_DIR / job_id
             with (folder / "log.txt").open("ab") as log:
+                model = job.get("model") or MODELS[0]["id"]
+                # the chosen model plans the part; on a scan it also reads the sheet and plans (the scan's builder
+                # stays on main.py's cheap SCAN_BUILD_MODEL); a vector drawing reads only D2C_MODEL
                 proc = subprocess.Popen([sys.executable, str(ROOT / "main.py"), str(folder / "drawing.pdf")],
                                         cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                                        env={**os.environ, "PYTHONUNBUFFERED": "1",
-                                             "D2C_MODEL": job.get("model") or MODELS[0]["id"]})
+                                        env={**os.environ, "PYTHONUNBUFFERED": "1", "D2C_MODEL": model,
+                                             "D2C_VISION_MODEL": model, "D2C_SCAN_REASON_MODEL": model})
                 with self.lock:
                     self.procs[job_id] = proc
                 code = proc.wait()
@@ -151,7 +154,7 @@ class Jobs:
         if run and (run / "result.json").is_file():
             r = json.loads((run / "result.json").read_text(encoding="utf-8"))
             job["result"] = {k: r.get(k) for k in ("status", "validated", "drawn_covered", "high_issues_left",
-                                                   "seconds", "cost_usd", "step")}
+                                                   "seconds", "cost_usd", "step", "trust")}
             job["cost_usd"] = round(r.get("cost_usd") or job["cost_usd"] or 0, 4)
         job["has_step"] = bool(run and (run / "model.step").is_file())
         return job
