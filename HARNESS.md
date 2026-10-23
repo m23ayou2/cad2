@@ -794,7 +794,7 @@ scored:
 | tier1/02 | 0.983 | **1.000** | — | round 2 |
 | tier1/03 | 0.996 | **1.000** | — | round 2 |
 | tier2/03 | 0.968 | **0.987** | 0.974 | round 3 |
-| tier2/04 | 0.998 | not scored yet | **1.000** | round 3 |
+| tier2/04 | 0.998 | **1.000** | **1.000** | round 3 |
 | tier2/05 | not scored yet | **1.000** | — | round 2 |
 
 - **Corrections improved the first build in every run scored so far.** Tier 1/02, tier 1/03 and tier 2/04 went
