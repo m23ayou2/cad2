@@ -1,6 +1,7 @@
 """Draw2CAD: drawing -> view analyses -> feature tree -> STEP.
 
     uv run python main.py cases/tier2/03/drawing.pdf [--view] [-v]
+    uv run python main.py a.pdf b.pdf c.pdf [--parallel 3] [--view]   # several drawings, side by side
     uv run python main.py --build runs/<run>          # rebuild the STEP from an existing plan
 
 The main agent (agents/main.md) reads the sheet, splits it into views with
@@ -16,11 +17,16 @@ answer is validated against the pydantic model its YAML names (src/schema.py). E
 views, one summary per view, plan.json, feature_tree.json, build attempts,
 model.py, model.step, validation/round_N/ (projections, images, reports, that
 round's model), viewer.html, trace.jsonl, and result.json.
+
+With several drawings, each one runs as its own `main.py <drawing>` process (its own run folder, nothing shared),
+up to --parallel at a time. Their logs, a summary (batch.json) and one 3D page with every part side by side
+(viewer.html) are saved under runs/batch-<time>/.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import inspect
 import io
 import json
@@ -1404,6 +1410,23 @@ def envelope_issues(run: Run, plan_result: dict) -> list[dict]:
              "evidence": [], "basis": "measured: bounding box of the built part"}]
 
 
+def new_run_dir(drawing: Path) -> Path:
+    """runs/<case>-<time>: cases/tier1/01/drawing.pdf -> tier1-01-<time>, any other PDF -> <folder>-<name>-<time>.
+    Drawings started in the same second (a batch) get -2, -3 ..."""
+    name = (f"{drawing.parent.parent.name}-{drawing.parent.name}" if drawing.stem == "drawing"
+            else f"{drawing.parent.name}-{drawing.stem}")
+    name = re.sub(r"[^\w.-]", "_", name)
+    base = RUNS_DIR / f"{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    for n in range(1, 100):
+        run_dir = base if n == 1 else base.with_name(f"{base.name}-{n}")
+        try:
+            run_dir.mkdir(parents=True)
+            return run_dir
+        except FileExistsError:
+            continue
+    raise OSError(f"could not make a run folder next to {base}")
+
+
 def solve(drawing: Path, rebuild: Path | None = None) -> Path:
     """Plan, build, validate and correct a drawing in a new run folder, or rebuild an existing run's plan."""
     max_cost = float(load_agent("main").settings.get("max_cost_usd", 1.0))
@@ -1423,10 +1446,7 @@ def solve(drawing: Path, rebuild: Path | None = None) -> Path:
         if (run.dir / "views" / f"{run.drawing.stem}_views.json").is_file():
             index_views(run)
     else:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = RUNS_DIR / f"{drawing.parent.parent.name}-{drawing.parent.name}-{stamp}"
-        run_dir.mkdir(parents=True)
-        run = open_run(drawing, run_dir, max_cost)
+        run = open_run(drawing, new_run_dir(drawing), max_cost)
         run.trace("run_start", drawing=str(drawing), scanned=scanned,
                   models={"vision": VISION_MODEL, "reasoning": SCAN_REASON_MODEL, "builder": SCAN_BUILD_MODEL}
                   if scanned else {"all": MODEL})
@@ -1537,22 +1557,113 @@ def keep_best_round(run: Run, rounds: list[dict]):
     write_viewer(run)
 
 
+# --------------------------------------------------------------------------- several drawings
+def solve_many(drawings: list[Path], parallel: int, verbose: bool = False) -> Path:
+    """Run each drawing in its own main.py process, `parallel` at a time; then summarise them and put every
+    model in one 3D page. Returns the batch folder."""
+    batch = RUNS_DIR / f"batch-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    batch.mkdir(parents=True, exist_ok=True)
+    procs: dict[int, subprocess.Popen] = {}
+    blog = log.getChild("batch")
+
+    def one(i: int, drawing: Path) -> dict:
+        name = re.sub(r"[^\w.-]", "_", f"{drawing.parent.name}-{drawing.stem}")
+        logfile = batch / f"{i + 1:02d}-{name}.log"
+        started = time.monotonic()
+        with logfile.open("wb") as out:
+            procs[i] = subprocess.Popen([sys.executable, str(ROOT / "main.py"), str(drawing)] + (["-v"] if verbose else []),
+                                        cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
+                                        env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            code = procs[i].wait()
+        text = logfile.read_text(encoding="utf-8", errors="replace")
+        found = re.search(r" run (\S+): ", text)  # main.py logs `run <name>: ...` once it has its run folder
+        run_dir = RUNS_DIR / found.group(1) if found else None
+        result_file = run_dir / "result.json" if run_dir else None
+        result = json.loads(result_file.read_text(encoding="utf-8")) if result_file and result_file.is_file() else {}
+        item = {"drawing": str(drawing), "log": logfile.name, "returncode": code,
+                "run_dir": str(run_dir) if run_dir else None,
+                "step": str(run_dir / "model.step") if run_dir and (run_dir / "model.step").is_file() else None,
+                "seconds": round(time.monotonic() - started, 1),
+                **{k: result.get(k) for k in ("status", "validated", "drawn_covered", "high_issues_left", "cost_usd")}}
+        if code != 0 and not result:
+            item["error"] = (text.strip().splitlines() or ["no output"])[-1][-300:]
+        blog.info("%s: %s in %.0fs%s", drawing, item.get("status") or "failed", item["seconds"],
+                  f", run {run_dir.name}" if run_dir else "")
+        return item
+
+    blog.info("%d drawing(s), %d at a time; logs in %s", len(drawings), parallel, batch)
+    items: list[dict] = [{}] * len(drawings)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, parallel))
+    futures = {pool.submit(one, i, d): i for i, d in enumerate(drawings)}
+    try:
+        pending = set(futures)
+        while pending:  # with a timeout, so Ctrl+C is seen, also on Windows
+            done, pending = concurrent.futures.wait(pending, timeout=1)
+            for f in done:
+                items[futures[f]] = f.result()
+    except KeyboardInterrupt:
+        blog.warning("stopping every drawing still running")
+        pool.shutdown(wait=False, cancel_futures=True)
+        for proc in list(procs.values()):
+            if proc.poll() is None:
+                proc.terminate()
+        raise
+    pool.shutdown()
+
+    steps = [(f"{Path(it['drawing']).parent.name}/{Path(it['drawing']).stem}", Path(it["step"]))
+             for it in items if it.get("step")]
+    viewer = None
+    if steps:
+        try:
+            viewer = visualization.write_viewer(steps, batch / "viewer.html", layout="grid",
+                                                title=f"{batch.name}: {len(steps)} part(s)")
+        except Exception as error:  # a STEP that does not tessellate must not lose the summary
+            blog.warning("could not write the 3D page: %s", error)
+    (batch / "batch.json").write_text(json.dumps({"drawings": items, "parallel": parallel,
+                                                  "viewer": viewer.name if viewer else None}, indent=2),
+                                      encoding="utf-8")
+    print(f"\n{'drawing':<40} {'result':<10} {'matches':>8} {'issues':>7} {'time':>7} {'cost':>8}  run")
+    for it in items:
+        cov = f"{it['drawn_covered']:.0%}" if it.get("validated") and it.get("drawn_covered") is not None else "-"
+        cost = f"${it['cost_usd']:.3f}" if it.get("cost_usd") is not None else "-"
+        issues = it.get("high_issues_left")
+        print(f"{it['drawing'][-40:]:<40} {it.get('status') or 'failed':<10} {cov:>8} "
+              f"{issues if issues is not None else '-':>7} {it['seconds']:>6.0f}s {cost:>8}  "
+              f"{Path(it['run_dir']).name if it['run_dir'] else it.get('error', '')}")
+    print(f"\nbatch: {batch}\n3D:    {viewer or 'no part was built'}")
+    return batch
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("drawing", type=Path, nargs="?", help="PDF drawing")
+    parser.add_argument("drawings", type=Path, nargs="*", metavar="drawing", help="PDF drawing(s)")
     parser.add_argument("--build", type=Path, metavar="RUN_DIR",
                         help="rebuild the STEP of an existing run from its plan, without planning again")
+    parser.add_argument("--parallel", type=int, default=3, help="drawings that run at the same time (default 3)")
     parser.add_argument("--view", action="store_true", help="open the 3D viewer in the browser at the end")
     parser.add_argument("-v", "--verbose", action="store_true", help="also log what the models say")
     args = parser.parse_args()
-    if not args.drawing and not args.build:
-        parser.error("give a drawing, or --build RUN_DIR")
+    if not args.drawings and not args.build:
+        parser.error("give one or more drawings, or --build RUN_DIR")
+    if args.build and args.drawings:
+        parser.error("--build takes a run folder, not drawings")
+    missing = [str(d) for d in args.drawings if not d.is_file()]
+    if missing:
+        parser.error("no such file: " + ", ".join(missing))
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
     for noisy in ("httpx", "httpcore", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    if len(args.drawings) > 1:
+        try:
+            batch = solve_many(args.drawings, args.parallel, args.verbose)
+        except KeyboardInterrupt:
+            sys.exit("stopped")
+        if args.view and (batch / "viewer.html").is_file():
+            webbrowser.open((batch / "viewer.html").resolve().as_uri())
+        return
     try:
-        out = solve(args.drawing, args.build)
+        out = solve(args.drawings[0] if args.drawings else None, args.build)
     except (ValueError, OSError, RuntimeError) as error:
         sys.exit(str(error))
     viewer = out.with_name("viewer.html")

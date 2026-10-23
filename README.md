@@ -41,6 +41,10 @@ key we sent you. An existing environment variable takes precedence.
    PDFs only for now). Under the steps, ask questions about the finished part.
 
 Several drawings can run at once: three at a time by default (`--parallel N`), the rest wait in the queue.
+Drawings added together form a **batch**: starting them opens the batch page, which shows every part side by side
+in one 3D view (each tinted like its row in the list), each part appearing as soon as its first solid is built and
+updated after every build. Click a row to fly to that part, **Show all** to see them all again, **Open** for
+that job's page. The start page lists recent batches under **See all in 3D**.
 **New drawing** goes back to the start page, which lists recent jobs to reopen. A job can be stopped; its
 run folder is kept. Jobs are saved under `runs/ui/<job>/`
 (the drawing, `job.json`, `log.txt`), and each job's run folder (plan, build
@@ -51,6 +55,12 @@ works offline (three.js is served from `web/vendor/`); only OpenRouter is called
 
 One drawing from the command line, without the interface:
 `uv run python main.py cases/tier1/01/drawing.pdf`.
+
+Several drawings from the command line, each in its own process, three at a time by default:
+`uv run python main.py cases/tier1/*/drawing.pdf --parallel 4 --view`. Each drawing gets its own run folder as
+above; the batch folder `runs/batch-<time>/` keeps one log per drawing, `batch.json` (result, match, issues,
+time, cost and run folder of each) and `viewer.html`, every built part side by side in 3D, which `--view` opens
+at the end. A summary table is printed when all are done. Ctrl+C stops them all.
 
 The pipeline runs the scripts the model writes on your machine, in a child process, with no sandbox.
 

@@ -156,11 +156,28 @@ details.raw pre { margin: 8px 0 0; max-height: 260px; overflow: auto; background
 .tabs .grow { flex: 1; } .tabs .tools { display: flex; gap: 8px; align-items: center; padding-bottom: 6px; }
 .pane { position: relative; min-height: 0; }
 #pdf { width: 100%; height: 100%; border: 0; background: var(--well); display: block; }
-#view { position: absolute; inset: 0; background: var(--well); }
-#view canvas { display: block; width: 100% !important; height: 100% !important; }
-#modelline { position: absolute; left: 12px; bottom: 10px; background: var(--sheet); border: 1px solid var(--rule);
+#view, #bview { position: absolute; inset: 0; background: var(--well); }
+#view canvas, #bview canvas { display: block; width: 100% !important; height: 100% !important; }
+#modelline, #bline { position: absolute; left: 12px; bottom: 10px; background: var(--sheet); border: 1px solid var(--rule);
              border-radius: var(--r); padding: 3px 8px; font-size: 12.5px; }
-#modelline:empty { display: none; }
+#modelline:empty, #bline:empty { display: none; }
+
+/* ---------------------------------------------------------------- batch page */
+.batches { margin: 0 0 20px; background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r); }
+.batches h2 { font-size: 13px; font-weight: 600; margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--rule); background: var(--well); }
+.batches .brow { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--rule); }
+.batches .brow:last-child { border-bottom: 0; }
+#batch { height: 100%; display: grid; grid-template-columns: minmax(320px, 400px) 1fr; }
+#bside { border-right: 1px solid var(--rule); background: var(--sheet); overflow-y: auto; min-width: 0; }
+.bitem { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 16px;
+         border-bottom: 1px solid var(--rule); cursor: pointer; }
+.bitem:hover { background: var(--well); }
+.bitem.on { background: var(--blue-wash); }
+.bitem .sw { width: 12px; height: 12px; border-radius: 2px; }
+.bitem .sw.none { background: transparent; border: 1px dashed var(--rule-strong); }
+.bitem .bn { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bitem .bs { font-size: 12.5px; color: var(--ink-2); }
+#bwork { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto 1fr; }
 .note { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-3); padding: 24px; text-align: center; }
 
 #proj { overflow-y: auto; padding: 12px 16px 24px; }
@@ -189,8 +206,8 @@ dialog img { display: block; max-width: 90vw; max-height: 80vh; background: #fff
 
 @media (max-width: 900px) {
   body { overflow: auto; } main { height: auto; }
-  #job { grid-template-columns: 1fr; } #side { border-right: 0; border-bottom: 1px solid var(--rule); }
-  #work { height: 70vh; }
+  #job, #batch { grid-template-columns: 1fr; } #side, #bside { border-right: 0; border-bottom: 1px solid var(--rule); }
+  #work, #bwork { height: 70vh; }
   .intake .opts input[type=text] { width: 100%; }
 }
 </style>
@@ -225,8 +242,28 @@ dialog img { display: block; max-width: 90vw; max-height: 80vh; background: #fff
           <button class="btn primary" id="start" disabled>Start</button>
         </div>
       </div>
+      <div id="batchlist"></div>
       <div id="jobtable"></div>
     </div>
+  </section>
+
+  <!-- ================================================================ drawings added together -->
+  <section id="batch" class="hidden">
+    <aside id="bside">
+      <div class="block">
+        <h2>Batch <span class="dim num" id="bcount"></span></h2>
+        <div class="sub" id="bsummary"></div>
+      </div>
+      <div id="blist"></div>
+    </aside>
+    <section id="bwork">
+      <div class="tabs">
+        <button class="on">3D models</button>
+        <span class="grow"></span>
+        <span class="tools"><button class="btn small" id="breset">Show all</button></span>
+      </div>
+      <div class="pane"><div id="bview"></div><div id="bline" class="num"></div></div>
+    </section>
   </section>
 
   <!-- ================================================================ one job -->
@@ -334,7 +371,10 @@ function fillModels(sel, key, withNotes = true) {
 let current = null;
 function route() {
   const m = location.hash.match(/^#\/job\/([\w-]+)(?:\/(drawing|model|proj))?/);
-  $("nav-jobs").classList.toggle("on", !m);
+  const b = location.hash.match(/^#\/batch\/([\w-]+)/);
+  $("nav-jobs").classList.toggle("on", !m && !b);
+  if (b) return openBatch(b[1]);
+  stopBatch();
   if (!m) return showJobs();
   if (current === m[1]) { if (m[2]) setTab(m[2]); return; }
   openJob(m[1], m[2]);
@@ -373,21 +413,26 @@ function drawPicked() {
 }
 $("start").onclick = async () => {
   $("start").disabled = true;
-  const files = picked.slice(); let last = null;
+  const files = picked.slice(); let last = null, added = 0;
+  // several drawings added together form a batch: its page shows every part in one 3D view
+  const batch = files.length > 1 ? new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + Math.random().toString(36).slice(2, 6) : null;
   for (const f of files) {
     try {
-      last = await api("/api/jobs", { method: "POST", body: f, headers: { "X-Filename": encodeURIComponent(f.name),
-        "X-Prompt": encodeURIComponent($("note").value.trim()), "X-Model": $("model").value } });
-      picked.splice(picked.indexOf(f), 1);
+      const headers = { "X-Filename": encodeURIComponent(f.name), "X-Prompt": encodeURIComponent($("note").value.trim()),
+                        "X-Model": $("model").value };
+      if (batch) headers["X-Batch"] = batch;
+      last = await api("/api/jobs", { method: "POST", body: f, headers });
+      picked.splice(picked.indexOf(f), 1); added++;
     } catch (err) { alert(`${f.name}: ${err.message}`); }
   }
   drawPicked(); $("note").value = "";
-  if (files.length === 1 && last) location.hash = `#/job/${last.id}`; else loadJobs();
+  if (added > 1) location.hash = `#/batch/${batch}`;
+  else if (last) location.hash = `#/job/${last.id}`; else loadJobs();
 };
 
 function showJobs() {
   current = null; stopJob();
-  $("job").classList.add("hidden"); $("jobs").classList.remove("hidden");
+  $("job").classList.add("hidden"); $("batch").classList.add("hidden"); $("jobs").classList.remove("hidden");
   $("barnote").textContent = "";
   loadJobs();
 }
@@ -396,6 +441,7 @@ async function loadJobs() {
   if ($("jobs").classList.contains("hidden")) return;
   let jobs = [];
   try { jobs = await api("/api/jobs"); } catch { return; }
+  $("batchlist").innerHTML = batchesHtml(jobs);
   const box = $("jobtable");
   if (!jobs.length) box.innerHTML = '<div class="empty">No jobs yet. Add a drawing above.</div>';
   else box.innerHTML = `<table class="grid"><thead><tr><th>Drawing</th><th>State</th><th>Result</th><th class="r">Matches drawing</th>
@@ -415,6 +461,26 @@ async function loadJobs() {
   for (const tr of box.querySelectorAll("tr.row")) tr.onclick = () => location.hash = `#/job/${tr.dataset.id}`;
   if (jobs.some((j) => !FINISHED.includes(j.status))) listTimer = setTimeout(loadJobs, 3000);
 }
+function batchCounts(jobs) {
+  const n = (s) => jobs.filter((j) => s.includes(j.status)).length;
+  const parts = [`${n(FINISHED)} of ${jobs.length} finished`];
+  if (n(["running"])) parts.push(`${n(["running"])} running`);
+  if (n(["queued"])) parts.push(`${n(["queued"])} waiting`);
+  const built = jobs.filter((j) => j.step_key).length;
+  return `${parts.join(", ")} · ${built} model${built === 1 ? "" : "s"} built`;
+}
+function batchesHtml(jobs) {  // the five latest batches, newest first
+  const by = new Map();
+  for (const j of jobs) if (j.batch) (by.get(j.batch) || by.set(j.batch, []).get(j.batch)).push(j);
+  if (!by.size) return "";
+  const rows = [...by.entries()].sort((a, b) => b[0].localeCompare(a[0])).slice(0, 5).map(([id, js]) => {
+    const started = js.map((j) => j.created).sort()[0];
+    return `<div class="brow"><b>${js.length} drawings</b><span class="dim num">${esc(started.replace("T", " ").slice(5, 16))}</span>
+      <span class="sub">${batchCounts(js)}</span><span style="flex:1"></span>
+      <a class="btn small" href="#/batch/${esc(id)}">See all in 3D</a></div>`;
+  }).join("");
+  return `<div class="batches"><h2>Batches</h2>${rows}</div>`;
+}
 
 // ================================================================== one job
 const J = {};
@@ -425,7 +491,8 @@ async function openJob(id, tab) {
   current = id;
   Object.assign(J, { id, job: null, open: new Set(), logOffset: 0, log: "", finished: false, wantTab: tab,
                      modelKey: null, modelBusy: false, modelTimer: null, proj: null, projLoaded: false });
-  $("jobs").classList.add("hidden"); $("job").classList.remove("hidden");
+  $("jobs").classList.add("hidden"); $("batch").classList.add("hidden"); $("job").classList.remove("hidden");
+  attach($("view"));
   $("steps").innerHTML = ""; $("raw").querySelector("pre").textContent = ""; $("raw").open = false;
   $("verdict").classList.add("hidden"); $("qa").classList.add("hidden"); $("ask").classList.add("hidden");
   $("qa").innerHTML = ""; $("proj").innerHTML = "";
@@ -651,14 +718,21 @@ async function runProjections() {
 $("zoomclose").onclick = () => $("zoom").close();
 
 // ------------------------------------------------------------------ 3D view
-const view = $("view");
+// one renderer and scene, moved between the job page (#view) and the batch page (#bview)
+let view = $("view");
 let renderer = null;
 try {
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.setPixelRatio(devicePixelRatio);
   view.appendChild(renderer.domElement);
 } catch {
-  view.innerHTML = '<div class="note">This browser cannot show 3D (WebGL is off). Download the STEP to open the part in your CAD software.</div>';
+  for (const v of [$("view"), $("bview")])
+    v.innerHTML = '<div class="note">This browser cannot show 3D (WebGL is off). Download the STEP to open the part in your CAD software.</div>';
+}
+function attach(host) {
+  view = host;
+  if (renderer && renderer.domElement.parentElement !== host) host.appendChild(renderer.domElement);
+  resize();
 }
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100000);
@@ -674,7 +748,8 @@ function resize() {
   if (!renderer || !w || !h) return;
   renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
 }
-new ResizeObserver(resize).observe(view);
+const observer = new ResizeObserver(resize);
+observer.observe($("view")); observer.observe($("bview"));
 (function loop() { if (!renderer) return; controls.update(); sun.position.copy(camera.position); renderer.render(scene, camera); requestAnimationFrame(loop); })();
 function clearModel() {
   if (part) { scene.remove(part); part = null; }
@@ -712,34 +787,141 @@ function watchModel() {
     watchModel();
   }, 4000);
 }
-function showMesh(mesh, refit = true) {
-  if (part) scene.remove(part);
-  part = new THREE.Group();
+function meshGroup(mesh, color = 0xb8bcc2) {
+  const group = new THREE.Group();
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(mesh.positions, 3));
   geo.setIndex(mesh.indices);
   geo.computeVertexNormals();
   // machined-aluminium grey with dark edges, like a part on the bench
-  part.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xb8bcc2, metalness: 0.25, roughness: 0.5,
-                                                                 polygonOffset: true, polygonOffsetFactor: 1 })));
+  group.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, metalness: 0.25, roughness: 0.5,
+                                                                  polygonOffset: true, polygonOffsetFactor: 1 })));
   const lines = new THREE.LineBasicMaterial({ color: 0x22262b });
   for (const e of mesh.edges) {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.Float32BufferAttribute(e, 3));
-    part.add(new THREE.Line(g, lines));
+    group.add(new THREE.Line(g, lines));
   }
+  return group;
+}
+function showMesh(mesh, refit = true) {
+  if (part) scene.remove(part);
+  part = meshGroup(mesh);
   scene.add(part);
   if (refit) fit();
 }
-function fit() {
-  if (!part) return;
-  const box = new THREE.Box3().setFromObject(part);
+function fitTo(objects) {
+  const box = new THREE.Box3();
+  for (const o of objects) box.expandByObject(o);
+  if (box.isEmpty()) return;
   const c = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3()).length() || 1;
   controls.target.copy(c);
   camera.position.copy(c).add(new THREE.Vector3(1, -1.25, 0.85).normalize().multiplyScalar(size * 1.6));
   camera.near = size / 1000; camera.far = size * 100; camera.updateProjectionMatrix();
 }
+const fit = () => { if (part) fitTo([part]); };
 $("reset").onclick = fit;
+
+// ================================================================== batch: every part of the drawings added together
+// One cell per part on a grid (rows of ceil(sqrt(n))), each tinted to match its row in the list. A part appears as
+// soon as its job has built a first solid and is replaced after every new build, like the job page's 3D view.
+const TINTS = [0x8fb0de, 0xe9a679, 0x8fcc9c, 0xc89bd2, 0xdcc56e, 0x7cc7c4, 0xe293ad, 0xb8bcc2];
+const hex = (c) => "#" + c.toString(16).padStart(6, "0");
+const B = { id: null, timer: null, jobs: [], groups: {}, keys: {}, sizes: {}, loading: false, fitted: false, focus: null };
+function stopBatch() {
+  clearTimeout(B.timer);
+  if (!B.id) return;
+  for (const g of Object.values(B.groups)) scene.remove(g);
+  Object.assign(B, { id: null, jobs: [], groups: {}, keys: {}, sizes: {}, fitted: false, focus: null });
+  $("bline").textContent = "";
+}
+async function openBatch(id) {
+  if (B.id === id) return;
+  stopJob(); stopBatch(); clearModel(); current = null;
+  B.id = id;
+  $("jobs").classList.add("hidden"); $("job").classList.add("hidden"); $("batch").classList.remove("hidden");
+  $("barnote").textContent = "Batch";
+  $("blist").innerHTML = ""; $("bsummary").textContent = "";
+  attach($("bview"));
+  $("bline").innerHTML = '<span class="spinner"></span> Waiting for the first model';
+  await batchTick();
+}
+async function batchTick() {
+  const id = B.id;
+  clearTimeout(B.timer);
+  try {
+    const jobs = (await api("/api/jobs")).filter((j) => j.batch === id)
+      .sort((a, b) => a.created.localeCompare(b.created) || a.name.localeCompare(b.name));
+    if (id !== B.id) return;
+    B.jobs = jobs;
+    drawBatchList();
+    await loadBatchModels();
+  } catch (err) { console.warn(err); }
+  if (id === B.id && B.jobs.some((j) => !FINISHED.includes(j.status) || (j.step_key && j.step_key !== B.keys[j.id])))
+    B.timer = setTimeout(batchTick, 3000);
+}
+function drawBatchList() {
+  const jobs = B.jobs;
+  $("bcount").textContent = jobs.length || "";
+  $("bsummary").textContent = jobs.length ? batchCounts(jobs) : "No job in this batch.";
+  $("blist").innerHTML = jobs.map((j, i) => {
+    const r = j.result || {}, size = B.sizes[j.id];
+    const bits = [`<span class="state s-${j.status}">${STATE[j.status] || j.status}</span>`];
+    if (FINISHED.includes(j.status)) bits.push(resultText(j));
+    if (r.validated) bits.push(`<span class="${level(r.drawn_covered)}">matches ${pct(r.drawn_covered)}</span>`);
+    if (r.high_issues_left) bits.push(`<span class="bad">${r.high_issues_left} issue${r.high_issues_left > 1 ? "s" : ""}</span>`);
+    if (size) bits.push(`<span class="num">${size.map((v) => +v.toFixed(1)).join(" × ")} mm</span>`);
+    return `<div class="bitem${B.focus === j.id ? " on" : ""}" data-id="${esc(j.id)}">
+      <span class="sw${B.groups[j.id] ? "" : " none"}" style="${B.groups[j.id] ? `background:${hex(TINTS[i % TINTS.length])}` : ""}"></span>
+      <div style="min-width:0"><div class="bn" title="${esc(j.name)}">${esc(j.name)}</div><div class="bs">${bits.join(" · ")}</div></div>
+      <a class="btn small" href="#/job/${esc(j.id)}">Open</a></div>`;
+  }).join("");
+  for (const el of $("blist").querySelectorAll(".bitem")) el.onclick = (e) => {
+    if (e.target.closest("a")) return;
+    const g = B.groups[el.dataset.id];
+    if (!g) return;
+    B.focus = el.dataset.id; fitTo([g]); drawBatchList();
+  };
+}
+async function loadBatchModels() {
+  if (B.loading) return;
+  B.loading = true;
+  const id = B.id;
+  let changed = false;
+  try {
+    for (const [i, j] of B.jobs.entries()) {
+      if (!j.step_key || j.step_key === B.keys[j.id]) continue;
+      const since = B.keys[j.id] ? `?since=${encodeURIComponent(B.keys[j.id])}` : "";
+      let r;
+      try { r = await api(`/api/jobs/${j.id}/model${since}`); } catch (err) { console.warn(err); continue; }
+      if (id !== B.id) return;
+      if (!r.key || r.unchanged) { if (r.key) B.keys[j.id] = r.key; continue; }
+      if (B.groups[j.id]) scene.remove(B.groups[j.id]);
+      B.groups[j.id] = meshGroup(r.mesh, TINTS[i % TINTS.length]);
+      scene.add(B.groups[j.id]);
+      B.keys[j.id] = r.key; B.sizes[j.id] = r.mesh.size;
+      changed = true;
+    }
+  } finally { B.loading = false; }
+  if (!changed) return;
+  layoutBatch();
+  drawBatchList();
+  const n = Object.keys(B.groups).length;
+  $("bline").textContent = `${n} of ${B.jobs.length} part${B.jobs.length === 1 ? "" : "s"} shown · click a part in the list to go to it`;
+  if (!B.fitted) { fitTo(Object.values(B.groups)); B.fitted = true; }
+}
+function layoutBatch() {
+  const order = B.jobs.map((j) => B.groups[j.id]).filter(Boolean);
+  for (const g of order) g.position.set(0, 0, 0);
+  const boxes = order.map((g) => new THREE.Box3().setFromObject(g));
+  const cell = 1.3 * Math.max(1, ...boxes.map((b) => { const s = b.getSize(new THREE.Vector3()); return Math.max(s.x, s.y); }));
+  const cols = Math.ceil(Math.sqrt(order.length));
+  order.forEach((g, i) => {
+    const c = boxes[i].getCenter(new THREE.Vector3());
+    g.position.set((i % cols) * cell - c.x, -Math.floor(i / cols) * cell - c.y, -boxes[i].min.z);
+  });
+}
+$("breset").onclick = () => { B.focus = null; fitTo(Object.values(B.groups)); drawBatchList(); };
 
 // ================================================================== boot
 try { const info = await api("/api/info"); MODELS = info.models; DEFAULT = info.default; } catch {}

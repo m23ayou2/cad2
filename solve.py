@@ -7,7 +7,8 @@ Opens http://127.0.0.1:8000 in the browser. Each drawing you add becomes a job t
 left side shows its log as it is written and the right side shows the newest STEP the builder has produced
 (every build attempt, then the final model), updated as soon as a new one appears. Finished models download as
 STEP. Jobs are saved under runs/ui/<job>/ (the drawing, job.json, log.txt) next to their run folder, so the list
-survives a restart; a job that was running when the server stopped is marked interrupted.
+survives a restart; a job that was running when the server stopped is marked interrupted. Drawings added together
+form a batch: its page shows every part side by side in one 3D view, each appearing as soon as it is built.
 
 Set OPENROUTER_API_KEY in .env. Model scripts run without a sandbox, as in main.py.
 """
@@ -58,6 +59,7 @@ class Jobs:
         self.jobs: dict[str, dict] = {}
         self.procs: dict[str, subprocess.Popen] = {}
         self.queue: list[str] = []
+        self.stopping: set[str] = set()  # running jobs the user stopped (on Windows they exit with code 1)
         self.wake = threading.Condition(self.lock)
         for path in sorted(JOBS_DIR.glob("*/job.json")):
             job = json.loads(path.read_text(encoding="utf-8"))
@@ -76,14 +78,15 @@ class Jobs:
         tmp.write_text(json.dumps(job, indent=2), encoding="utf-8")
         tmp.replace(path)  # never a half-written job.json
 
-    def add(self, name: str, pdf: bytes, prompt: str = "", model: str = MODELS[0]["id"]) -> dict:
+    def add(self, name: str, pdf: bytes, prompt: str = "", model: str = MODELS[0]["id"],
+            batch: str | None = None) -> dict:
         job_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
         folder = JOBS_DIR / job_id
         folder.mkdir(parents=True)
         (folder / "drawing.pdf").write_bytes(pdf)
         # the prompt is kept and shown with the job; for now only the drawing drives the pipeline
-        job = {"id": job_id, "name": name, "prompt": prompt, "model": model, "status": "queued", "created": now(), "started": None,
-               "ended": None, "returncode": None, "run_dir": None}
+        job = {"id": job_id, "name": name, "prompt": prompt, "model": model, "batch": batch, "status": "queued",
+               "created": now(), "started": None, "ended": None, "returncode": None, "run_dir": None}
         with self.lock:
             self.jobs[job_id] = job
             self._save(job)
@@ -99,8 +102,10 @@ class Jobs:
                 job.update(status="stopped", ended=now())
                 self._save(job)
             proc = self.procs.get(job_id)
+            if proc:
+                self.stopping.add(job_id)
         if proc and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)  # main.py and the CAD processes it started
+            kill_tree(proc)
         return job
 
     def _worker(self):
@@ -123,7 +128,8 @@ class Jobs:
                 code = proc.wait()
             with self.lock:
                 self.procs.pop(job_id, None)
-                stopped = code < 0 or job["status"] == "stopped"
+                stopped = code < 0 or job["status"] == "stopped" or job_id in self.stopping
+                self.stopping.discard(job_id)
                 job.update(status="stopped" if stopped else ("done" if code == 0 else "failed"),
                            ended=now(), returncode=code, run_dir=job["run_dir"] or find_run_dir(job_id))
                 self._save(job)
@@ -158,6 +164,14 @@ class Jobs:
         found = latest_step(run) if run and run.is_dir() else None
         job["step_key"] = f"{found[0].name}:{found[0].stat().st_mtime_ns}" if found else None
         return job
+
+
+def kill_tree(proc: subprocess.Popen):
+    """Stop main.py and the CAD and projection processes it started."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        os.killpg(proc.pid, signal.SIGTERM)  # start_new_session made main.py a process group leader
 
 
 def now() -> str:
@@ -571,7 +585,10 @@ class Handler(BaseHTTPRequestHandler):
                 model = self.headers.get("X-Model") or MODELS[0]["id"]
                 if model not in MODEL_IDS:
                     return self.send_json({"error": f"unknown model {model}"}, HTTPStatus.BAD_REQUEST)
-                job = self.jobs.add(name, data, prompt, model)
+                batch = self.headers.get("X-Batch") or None  # drawings added together share one
+                if batch and not re.fullmatch(r"[\w-]{1,40}", batch):
+                    return self.send_json({"error": "bad batch id"}, HTTPStatus.BAD_REQUEST)
+                job = self.jobs.add(name, data, prompt, model, batch)
                 return self.send_json(self.jobs.view(job["id"]), HTTPStatus.CREATED)
             if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "projections":
                 job = self.job_or_404(parts[2])
