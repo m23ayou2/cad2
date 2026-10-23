@@ -31,8 +31,10 @@ key we sent you. An existing environment variable takes precedence.
    with its state, result, how much of the drawing the part matches, open issues, time, cost and model.
 2. **A job**: the left column is its title block (drawing, state, result, model, time, cost), **Download
    STEP**, an assessment once it is finished, and its steps (each agent run and check, with time and cost;
-   open one to see what it did, or the full log). The right side shows the **Drawing** while the part is
-   built, then the **3D model** and the **Projections**: the model projected into every view of the drawing,
+   open one to see what it did, or the full log). The right side shows the **Drawing**, the **3D model** as
+   soon as a first solid is built (it updates by itself after every build attempt, correction round or
+   rebuild, and the camera stays where you left it; a dot on the tab marks a new model while you are on
+   another tab), and, once the job is finished, the **Projections**: the model projected into every view of the drawing,
    side by side with the drawn view or overlaid on it (drawing black, model red; orange = drawn but missing
    in the model, purple = in the model but not drawn), how much of each view matches, and every dimension
    callout checked. **Run projections** projects the current model again (no model calls, about 30 s; vector

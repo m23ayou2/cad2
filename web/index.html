@@ -150,6 +150,9 @@ details.raw pre { margin: 8px 0 0; max-height: 260px; overflow: auto; background
 .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 0 9px; cursor: pointer; color: var(--ink-2); }
 .tabs button.on { color: var(--ink); border-bottom-color: var(--blue); }
 .tabs button:disabled { color: var(--ink-3); opacity: .6; cursor: default; }
+.tabs button.fresh::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px;
+  border-radius: 50%; background: var(--blue); vertical-align: middle; }
+#modelline.updated { border-color: var(--blue); box-shadow: 0 0 0 2px var(--blue-wash); transition: box-shadow .2s; }
 .tabs .grow { flex: 1; } .tabs .tools { display: flex; gap: 8px; align-items: center; padding-bottom: 6px; }
 .pane { position: relative; min-height: 0; }
 #pdf { width: 100%; height: 100%; border: 0; background: var(--well); display: block; }
@@ -415,13 +418,13 @@ async function loadJobs() {
 
 // ================================================================== one job
 const J = {};
-function stopJob() { clearTimeout(J.timer); clearTimeout(J.projTimer); J.id = null; }
+function stopJob() { clearTimeout(J.timer); clearTimeout(J.projTimer); clearTimeout(J.modelTimer); J.id = null; }
 
 async function openJob(id, tab) {
   stopJob();
   current = id;
-  Object.assign(J, { id, job: null, open: new Set(), logOffset: 0, log: "", finished: false, wantTab: tab, modelLoaded: false,
-                     proj: null, projLoaded: false });
+  Object.assign(J, { id, job: null, open: new Set(), logOffset: 0, log: "", finished: false, wantTab: tab,
+                     modelKey: null, modelBusy: false, modelTimer: null, proj: null, projLoaded: false });
   $("jobs").classList.add("hidden"); $("job").classList.remove("hidden");
   $("steps").innerHTML = ""; $("raw").querySelector("pre").textContent = ""; $("raw").open = false;
   $("verdict").classList.add("hidden"); $("qa").classList.add("hidden"); $("ask").classList.add("hidden");
@@ -461,6 +464,12 @@ function render(st) {
   const dl = $("dl");
   dl.setAttribute("aria-disabled", j.has_step ? "false" : "true");
   dl.href = j.has_step ? `/api/jobs/${j.id}/step` : "#";
+  // the 3D model opens as soon as a build attempt has made a solid, and follows every new one
+  const mtab = document.querySelector('.tabs [data-tab="model"]');
+  if (j.step_key) mtab.disabled = false;
+  if (j.step_key && j.step_key !== J.modelKey) {
+    if (modelShown()) loadModel(); else mtab.classList.add("fresh");
+  }
 
   // steps: rows updated in place, so open rows stay open
   const box = $("steps");
@@ -573,7 +582,10 @@ function setTab(tab) {
   $("pane-model").classList.toggle("hidden", tab !== "model");
   $("proj").classList.toggle("hidden", tab !== "proj");
   $("tools-model").classList.toggle("hidden", tab !== "model");
-  if (tab === "model") { resize(); if (!J.modelLoaded) loadModel(); }
+  if (tab === "model") {
+    resize(); btn.classList.remove("fresh");
+    loadModel(); watchModel();
+  }
   if (tab === "proj" && !J.projLoaded) loadProjections();
 }
 
@@ -668,18 +680,39 @@ function clearModel() {
   if (part) { scene.remove(part); part = null; }
   $("modelline").textContent = "";
 }
+const modelShown = () => !$("pane-model").classList.contains("hidden");
+// The newest STEP of the run, loaded again whenever it changes: each build attempt while the part is built, each
+// correction round, the round kept at the end, a later rebuild (main.py --build). The camera stays where it is.
 async function loadModel() {
   const id = J.id;
-  J.modelLoaded = true;
-  $("modelline").innerHTML = '<span class="spinner"></span> Loading the model';
+  if (J.modelBusy) return;
+  J.modelBusy = true;
+  const first = !J.modelKey;
+  if (first) $("modelline").innerHTML = '<span class="spinner"></span> Loading the model';
   try {
-    const r = await api(`/api/jobs/${id}/model`);
-    if (id !== J.id || !r.key) return;
-    showMesh(r.mesh);
-    $("modelline").textContent = `${r.label} · ${r.mesh.size.map((v) => +v.toFixed(2)).join(" × ")} mm · ${Math.round(r.mesh.volume).toLocaleString()} mm³`;
-  } catch (err) { $("modelline").textContent = `Could not load the model: ${err.message}`; J.modelLoaded = false; }
+    const since = J.modelKey ? `?since=${encodeURIComponent(J.modelKey)}` : "";
+    const r = await api(`/api/jobs/${id}/model${since}`);
+    if (id !== J.id || !r.key || r.unchanged) return;
+    showMesh(r.mesh, first);
+    J.modelKey = r.key;
+    const line = $("modelline");
+    line.textContent = `${r.label} · ${r.mesh.size.map((v) => +v.toFixed(2)).join(" × ")} mm · ${Math.round(r.mesh.volume).toLocaleString()} mm³`
+      + (first ? "" : ` · updated ${new Date().toLocaleTimeString()}`);
+    if (!first) { line.classList.add("updated"); setTimeout(() => line.classList.remove("updated"), 1500); }
+  } catch (err) { if (first) $("modelline").textContent = `Could not load the model: ${err.message}`; }
+  finally { J.modelBusy = false; }
 }
-function showMesh(mesh) {
+// a running job's tick already follows its STEP; a finished one is checked every few seconds while it is shown
+function watchModel() {
+  clearTimeout(J.modelTimer);
+  const id = J.id;
+  J.modelTimer = setTimeout(async () => {
+    if (id !== J.id || !modelShown()) return;
+    if (FINISHED.includes(J.job?.status)) await loadModel();
+    watchModel();
+  }, 4000);
+}
+function showMesh(mesh, refit = true) {
   if (part) scene.remove(part);
   part = new THREE.Group();
   const geo = new THREE.BufferGeometry();
@@ -696,7 +729,7 @@ function showMesh(mesh) {
     part.add(new THREE.Line(g, lines));
   }
   scene.add(part);
-  fit();
+  if (refit) fit();
 }
 function fit() {
   if (!part) return;

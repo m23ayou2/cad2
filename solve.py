@@ -154,6 +154,9 @@ class Jobs:
                                                    "seconds", "cost_usd", "step")}
             job["cost_usd"] = round(r.get("cost_usd") or job["cost_usd"] or 0, 4)
         job["has_step"] = bool(run and (run / "model.step").is_file())
+        # the newest STEP (a build attempt while the builder works, then model.step): the page follows it live
+        found = latest_step(run) if run and run.is_dir() else None
+        job["step_key"] = f"{found[0].name}:{found[0].stat().st_mtime_ns}" if found else None
         return job
 
 
